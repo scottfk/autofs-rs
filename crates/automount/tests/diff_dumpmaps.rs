@@ -119,7 +119,7 @@ const MASTER_LINES: &[&str] = &[
     "/o //server/cn=x",
     "/p yp:auto.p",
     "/p nis auto.p",
-    // nisplus comes with its module in phase 2.
+    "/p nisplus:auto.p",
     "/q multi /etc/autofs/auto.a -- /etc/autofs/auto.b",
     "/q multi file:/etc/autofs/auto.a -ro -- file,sun:/etc/autofs/auto.b -rw",
     "/q multi,sun /etc/autofs/auto.a",
@@ -615,4 +615,16 @@ fn dump_amd_sections() {
             .map("auto.amd", AMD_MAP)
             .map("amd/auto.inamd", "a type:=nfs\n"),
     );
+}
+
+#[test]
+fn dump_nisplus() {
+    for (i, dom) in ["", "example.com"].iter().enumerate() {
+        let c = Case::new(&format!("nisplus_{i}"), &["-d", "-m"])
+            .etc("nsswitch.conf", "automount: nisplus files\n")
+            .master("/a nisplus:auto.a\n/b auto.b\n/- nisplus:auto.direct\n")
+            .map("auto.b", "k v\n");
+        let c = if dom.is_empty() { c } else { c.setup(&format!("echo {dom} >/proc/sys/kernel/domainname")) };
+        check(c);
+    }
 }

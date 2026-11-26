@@ -4,7 +4,8 @@
 //! (`lookup_file.so` and so on, and the compatibility symlinks `lookup_files.so`,
 //! `lookup_nis.so`, `mount_nfs4.so`, `mount_ext3.so`, `mount_ext4.so`) opens it;
 //! any other name fails as `dlopen()` fails for a missing file, with the same
-//! message.
+//! message. `lookup_nisplus.so` is built but can't be loaded on hydra (libnsl 2
+//! has no NIS+ functions), so `nisplus` fails with that `dlopen()` message.
 
 use std::sync::Arc;
 
@@ -47,7 +48,6 @@ fn lookup_name(name: &[u8]) -> Option<&'static str> {
         b"program" => "program",
         b"dir" => "dir",
         b"yp" | b"nis" => "yp",
-        b"nisplus" => "nisplus",
         b"hosts" => "hosts",
         b"multi" => "multi",
         b"userhome" => "userhome",
@@ -62,6 +62,18 @@ pub fn open_lookup(
     mapfmt: Option<&[u8]>,
     argv: &Argv,
 ) -> Result<Box<dyn LookupMod>, i32> {
+    if cstr::eq(name, b"nisplus") {
+        if let Some(p) = err_prefix {
+            logerr!(
+                "open_lookup",
+                "68",
+                "{}cannot open lookup module nisplus ({}/lookup_nisplus.so: undefined symbol: nis_list)",
+                p,
+                AUTOFS_LIB_DIR
+            );
+        }
+        return Err(NSS_STATUS_UNKNOWN);
+    }
     let which = match lookup_name(name) {
         Some(w) => w,
         None => {

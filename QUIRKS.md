@@ -74,6 +74,14 @@ The last section lists where the port can't or doesn't follow C, and why.
 | low | `sanitize_path()` never removes a trailing `/` from a key (its test measures the string past its end). | `parse_subs::sanitize_path` | `dump_map_scanner` |
 | low | A line that starts with a blank after an entry continues it, but `read_one()` reads the continuation without keeping it; anything but blanks on it makes the whole entry a "bad map entry". | `lookup_file::read_one` | `dump_map_scanner` |
 
+## Multi maps (modules/lookup_multi.c)
+
+| Severity | Quirk | Where | Test |
+|---|---|---|---|
+| low | A map with a format (`multi file,sun:/m1 -- ...`) is opened as the module `file,sun`, which doesn't exist, so the whole multi map fails. A type word of 20 bytes or more (any map name starting `file`, `yp`, `nis`, `ldap` or `sss`) trips `_FORTIFY_SOURCE`. | `lookup_multi::nss_open_lookup` | `dump_master_lines` |
+| low | The map read checks each map's NSS status against `LKP_FAIL` (1): `NOTFOUND` and `TRYAGAIN` count as failures, `UNAVAIL` as a success. All the maps read into the multi map's one cache under the multi map's source, so a key in two of them shows once (the first). `--dumpmaps` numbers every map `map[1]`. | `LookupMulti::read_map`, `master::print_map_info` | `dump_master_lines` |
+| low | Closing the maps stops at the first one whose close fails (`rv = rv \|\| close_lookup()`); the rest stay open. | `LookupMulti::done` | - |
+
 ## Startup (daemon/automount.c, lib/mounts.c)
 
 | Severity | Quirk | Where | Test |
@@ -86,6 +94,7 @@ The last section lists where the port can't or doesn't follow C, and why.
 
 | What | Why |
 |---|---|
+| `nisplus` maps fail to open, with the `dlopen()` message hydra's build gives (`lookup_nisplus.so: undefined symbol: nis_list`): libnsl 2 has no NIS+ functions, so C can't load the module either. | hydra's libnsl. |
 | The modules are built in: there are no `/usr/lib64/autofs/*.so` files or `libautofs.so`, and a map type without a module fails with the message `dlopen()` would give for the missing file. | Every module hydra has comes from autofs itself (see the README). |
 | `-Dname` without `=` is ignored. C's `macro_parse_globalvar()` walks off the end of its stack buffer looking for the `=`. | Undefined behavior; there's nothing to match. |
 | The master map scanner's 1024-byte `buff` grows instead of overrunning into the variables after it, and the scanner's own `master_error()` logs an empty line where C prints whatever a register held (`logmsg("%s")` without an argument; only for tokens over 2048 bytes). | Memory corruption and an uninitialized read; the hostile input phase looks at what the overrun does in the reference binary. |
