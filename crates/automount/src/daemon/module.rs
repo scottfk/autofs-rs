@@ -32,6 +32,10 @@ pub trait LookupMod: Send + std::fmt::Debug {
 /// A parse module's entry points.
 pub trait ParseMod: Send + std::fmt::Debug {
     fn reinit(&mut self, argv: &Argv) -> i32;
+    /// The sun parser's macro table (`pctxt->subst`), for program maps.
+    fn subst(&self) -> Option<crate::libautofs::macros::Table> {
+        None
+    }
     /// `parse_mount()`.
     fn mount(&mut self, _ap: &Arc<AutofsPoint>, _map: &Arc<MapSource>, _name: &[u8], _mapent: Option<&[u8]>) -> i32 {
         panic!("parse_mount isn't ported yet for this format (phase 2)");

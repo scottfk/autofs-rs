@@ -242,3 +242,8 @@ pub fn macro_setenv(table: &[SubstVar]) {
 pub fn macro_lock() -> std::sync::MutexGuard<'static, ()> {
     MACRO_LOCK.lock().unwrap()
 }
+
+/// The global (system) table, head first.
+pub fn global_table() -> Table {
+    GLOBAL.lock().unwrap().table.clone()
+}

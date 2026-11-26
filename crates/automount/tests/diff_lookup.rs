@@ -186,3 +186,60 @@ fn lookup_browse() {
     );
     check_drv(many("lk_nobrowse", "-nobrowse", "k1 s:/1\n", &["k1"]));
 }
+
+const PROG: &str = r#"#!/bin/sh
+case "$1" in
+env) env | sort | grep -v '^_=\|^LD_LIBRARY_PATH=' >&2; echo "s:/env" ;;
+quoted) printf -- '-ro \\\n  s:/a\\ b\n' ;;
+multi) printf 's:/first\nignored second line\n' ;;
+fail) echo "s:/x"; exit 3 ;;
+empty) exit 0 ;;
+spaces) printf '   \n' ;;
+stderr) echo "err one" >&2; printf 'err two' >&2; echo "s:/e" ;;
+long) head -c 3000 /dev/zero | tr '\0' x >&2; echo "s:/l" ;;
+pwd) pwd >&2; echo "s:/p" ;;
+*) echo "-fstype=nfs4,hard $1:/" ;;
+esac
+"#;
+
+fn prog_case(name: &str, keys: &[&str]) -> Case {
+    let l: Vec<(&str, &str)> = keys.iter().map(|k| ("/mnt/p", *k)).collect();
+    lk(name, "/mnt/p /etc/autofs/auto.prog -DFOO=bar\n", &l).etc_mode("autofs/auto.prog", PROG.as_bytes(), 0o755)
+}
+
+#[test]
+fn lookup_program() {
+    check_drv(prog_case(
+        "lk_prog",
+        &["ronda", "ronda", "quoted", "multi", "fail", "fail", "empty", "spaces", "stderr", "long", "pwd"],
+    ));
+}
+
+#[test]
+fn lookup_program_env() {
+    check_drv(prog_case("lk_prog_env", &["env"]));
+    check_drv(prog_case("lk_prog_env_std", &["env"]).conf("[ autofs ]\nforce_standard_program_map_env = yes\n"));
+}
+
+#[test]
+fn lookup_program_cwd() {
+    check_drv(prog_case("lk_prog_cwd", &["pwd"]).setup("mkdir -p /mnt/p"));
+}
+
+#[test]
+#[ignore = "hydra's map gives a multi-mount entry (\"/ ronda:/\"): phase 4"]
+fn lookup_program_hydra() {
+    // hydra's auto.netv4 with a fake showmount.
+    let netv4 = "#!/bin/bash\nkey=\"$1\"\nopts=\"-fstype=nfs4,hard,nodev,nosuid\"\nSMNT=@T@/showmount\n\
+                 $SMNT --no-headers -e $key | LC_ALL=C cut -d' ' -f1 | LC_ALL=C head -n1 | \\\n\
+                 awk -v key=\"$key\" -v opts=\"$opts\" -- '\n\
+                 BEGIN { ORS=\"\"; first=1 }\n { if (first) { print opts; first=0 }; print \" \\\\\\n\\t\" \"/\", key \":\" \"/\" }\n\
+                 END { if (!first) print \"\\n\"; else exit 1 }\n' | sed 's/#/\\\\#/g'\n";
+    let showmount = "#!/bin/sh\n[ \"$3\" = ronda ] && printf '/ 192.168.1.0/24\\n/media 192.168.1.0/24\\n'\nexit 0\n";
+    let c = lk("lk_hydra", "/mnt/net /etc/autofs/auto.netv4\n", &[("/mnt/net", "ronda"), ("/mnt/net", "nohost")])
+        .etc_mode("autofs/auto.netv4", netv4.as_bytes(), 0o755)
+        .file("showmount", showmount.as_bytes())
+        .setup("chmod 755 @T@/showmount")
+        .conf("[ autofs ]\ntimeout = 300\nbrowse_mode = no\nmount_nfs_default_protocol = 4\n");
+    check_drv(c);
+}

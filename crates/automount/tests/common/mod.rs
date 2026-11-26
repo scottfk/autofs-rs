@@ -558,10 +558,12 @@ pub fn run(case: &Case, imp: &Impl) -> Outcome {
         let src = recorder_file(p);
         std::fs::hard_link(&src, t.join(format!("bin/rec-{p}"))).unwrap();
     }
+    let root_s = fixed_root().to_str().unwrap().to_string();
     for (p, c, mode) in &case.etc {
         let f = t.join("etc").join(p);
         std::fs::create_dir_all(f.parent().unwrap()).unwrap();
-        std::fs::write(&f, c).unwrap();
+        let c = String::from_utf8_lossy(c).replace("@T@", &root_s).into_bytes();
+        std::fs::write(&f, &c).unwrap();
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(*mode)).unwrap();
     }
     for (p, c) in &case.files {

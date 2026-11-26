@@ -146,7 +146,7 @@ comes in two tiers:
    the timeout, and `SIGHUP` (reload), `SIGUSR1` (prune), `SIGUSR2` and `SIGTERM`
    (shutdown, with and without busy mounts).
 4. **Direct mounts, multi-mounts and nesting (planned):** direct maps, offset mounts
-   and multi-mount trees, `mount_autofs` (nested `-fstype=autofs` submounts),
+   and multi-mount trees (hydra's `/net` program map answers with one: `/ host:/`), `mount_autofs` (nested `-fstype=autofs` submounts),
    `mount_ext2` (with its `fsck` run), `mount_afs`, `mount_changer`, map reloads that add,
    change or remove entries while mounts are in use, and restart over existing mounts
    (`README.active-restart`).

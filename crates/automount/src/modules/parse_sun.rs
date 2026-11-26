@@ -514,6 +514,10 @@ impl ParseSun {
 }
 
 impl ParseMod for ParseSun {
+    fn subst(&self) -> Option<Table> {
+        Some(self.subst.clone())
+    }
+
     /// `parse_mount()`.
     fn mount(&mut self, ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, name: &[u8], mapent: Option<&[u8]>) -> i32 {
         let logopt = ap.logopt();
