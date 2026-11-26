@@ -120,9 +120,16 @@ const MASTER_LINES: &[&str] = &[
     "/p yp:auto.p",
     "/p nis auto.p",
     // nisplus comes with its module in phase 2.
-    // Other multi maps come with lookup_multi in phase 2; this one crashes
-    // in the parser (append_argv() through a NULL vector).
+    "/q multi /etc/autofs/auto.a -- /etc/autofs/auto.b",
+    "/q multi file:/etc/autofs/auto.a -ro -- file,sun:/etc/autofs/auto.b -rw",
+    "/q multi,sun /etc/autofs/auto.a",
+    // This one crashes in the parser (append_argv() through a NULL vector).
     "/q multi -hosts",
+    "/q multi /etc/autofs/auto.a --",
+    "/q multi auto.a -- auto.b -- /etc/autofs/auto.a",
+    "/q multi file:/etc/autofs/auto.missing -- /etc/autofs/auto.b",
+    "/q multi yp:auto.a -- /etc/autofs/auto.b",
+    "/q multi file_this_name_is_long_ok -- /etc/autofs/auto.b",
     "/r file /etc/autofs/auto.a",
     "/r file  :  /etc/autofs/auto.a",
     // amd maps come with parse_amd in phase 2.
