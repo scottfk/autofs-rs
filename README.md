@@ -32,12 +32,13 @@ below), and so does this port.
 
 ## Status
 
-Phase 1 (groundwork, configuration, the master map and `--dumpmaps`) is done (PR #2): `automount -m` and `automount -m TYPE NAME` work for file, dir,
-program and `-hosts` maps in sun format, with the configuration, `nsswitch.conf`, master
-map includes and map includes, and match C byte for byte in 152 differential cases (stdout, stderr,
-exit status and every `mount`/`umount` command), crashes included. Starting the daemon
-stops after the kernel protocol check (which needs root on the test VM). Next: phase 2
-(maps and lookups).
+Phase 1 (groundwork, configuration, the master map and `--dumpmaps`) is done (PR #2):
+`automount -m` and `automount -m TYPE NAME` work for file, dir, program and `-hosts`
+maps in sun format, with the configuration, `nsswitch.conf`, master map includes and map
+includes, and match C byte for byte in 152 differential cases (stdout, stderr, exit
+status and every `mount`/`umount` command), crashes included. Starting the daemon stops
+after the kernel protocol check (which needs root on the test VM). Next: phase 2 (maps
+and lookups).
 
 The plan and its status live in the [roadmap](#roadmap) below, which is updated as each
 step lands.
