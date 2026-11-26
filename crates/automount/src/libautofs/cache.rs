@@ -20,6 +20,9 @@ use crate::sys;
 pub const CHE_FAIL: i32 = 0x0000;
 pub const CHE_OK: i32 = 0x0001;
 pub const CHE_UPDATED: i32 = 0x0002;
+pub const CHE_MISSING: i32 = 0x0008;
+pub const CHE_COMPLETED: i32 = 0x0010;
+pub const CHE_UNAVAIL: i32 = 0x0040;
 
 const NULL_MAP_HASHSIZE: u32 = 64;
 
@@ -38,6 +41,8 @@ pub struct Mapent {
     pub dev: u64,
     pub ino: u64,
     pub flags: u32,
+    /// The pushed-down map entries (`struct stack`), top first: (mapent, age).
+    pub stack: Vec<(Option<Vec<u8>>, i64)>,
 }
 
 /// The cache's contents (held under its lock).
@@ -179,6 +184,7 @@ impl CacheInner {
             dev: u64::MAX,
             ino: u64::MAX,
             flags: 0,
+            stack: Vec::new(),
         };
         match self.lookup_distinct(key) {
             None => self.hash[h].insert(0, me),
@@ -227,6 +233,63 @@ impl CacheInner {
                 self.add(source, key, mapent, age);
                 CHE_UPDATED
             }
+        }
+    }
+
+    /// `cache_push_mapent()`.
+    pub fn push_mapent(&mut self, p: Pos, mapent: Option<&[u8]>) -> i32 {
+        let me = self.get_mut(p);
+        let Some(old) = me.mapent.take() else { return CHE_FAIL };
+        me.stack.insert(0, (Some(old), me.age));
+        me.mapent = mapent.map(|m| cstr::c(m).to_vec());
+        CHE_OK
+    }
+
+    /// `cache_pop_mapent()`.
+    pub fn pop_mapent(&mut self, p: Pos) -> i32 {
+        let me = self.get_mut(p);
+        match me.stack.first() {
+            Some((Some(_), _)) => {}
+            _ => return CHE_FAIL,
+        }
+        let (m, age) = me.stack.remove(0);
+        if age < me.age {
+            return CHE_OK;
+        }
+        me.mapent = m;
+        CHE_OK
+    }
+
+    /// `cache_lookup_negative()`: `CHE_UNAVAIL` while the negative timeout
+    /// hasn't passed; else drop an expired entry that has no map entry.
+    pub fn lookup_negative(&mut self, p: Pos, key: &[u8]) -> i32 {
+        if self.get(p).status >= sys::monotonic_time() {
+            return CHE_UNAVAIL;
+        }
+        if self.get(p).mapent.is_none()
+            && let Some(sp) = self.lookup_distinct(key)
+            && self.get(sp).mapent.is_none()
+            && self.pop_mapent(sp) == CHE_FAIL
+        {
+            self.delete(key);
+        }
+        CHE_OK
+    }
+
+    /// `cache_update_negative()`.
+    pub fn update_negative(&mut self, source: usize, key: &[u8], timeout: i64) {
+        let now = sys::monotonic_time();
+        if key == b"*" {
+            return;
+        }
+        let rv = match self.lookup_distinct(key) {
+            Some(p) => self.push_mapent(p, None),
+            None => self.update(source, key, None, now),
+        };
+        if rv != CHE_FAIL
+            && let Some(p) = self.lookup_distinct(key)
+        {
+            self.get_mut(p).status = now + timeout;
         }
     }
 

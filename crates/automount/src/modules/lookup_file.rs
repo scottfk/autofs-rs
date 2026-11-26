@@ -1,6 +1,8 @@
-//! `modules/lookup_file.c`: flat file maps, master and indirect/direct. This
-//! phase has the reading (`read_one()`'s scanner, `+` includes, the master map
-//! and `--dumpmaps` map reads); key lookups come with the daemon.
+//! `modules/lookup_file.c`: flat file maps, master and indirect/direct: the
+//! reading (`read_one()`'s scanner, `+` includes, the master map and map
+//! reads) and key lookups (`lookup_mount()`: the negative cache, the map file
+//! read for the key and the wildcard when it changed, the cache match, and
+//! the parse module).
 //!
 //! The scanner works on the file one `getc()` at a time, as C does, with
 //! `ungetc()` and the end-of-file flag kept the same way.
@@ -12,6 +14,7 @@ use crate::daemon::master::{self, AutofsPoint, MAP_FLAG_FORMAT_AMD, MapSource, M
 use crate::daemon::master_parse;
 use crate::daemon::module::{self, LookupMod, ParseMod};
 use crate::libautofs::args::{self, Argv};
+use crate::libautofs::cache::{CHE_COMPLETED, CHE_FAIL, CHE_MISSING, CHE_OK, CHE_UNAVAIL, CHE_UPDATED};
 use crate::libautofs::cstr;
 use crate::libautofs::log::LOGOPT_NONE;
 use crate::libautofs::nsswitch::{
@@ -430,6 +433,261 @@ impl LookupFile {
     }
 }
 
+impl LookupFile {
+    /// `match_key()`: an exact key match updates the cache (amd partial
+    /// matches come with the amd parser).
+    fn match_key(&self, source: &Arc<MapSource>, map_key: &[u8], key: &[u8], mapent: &[u8]) -> i32 {
+        let age = sys::monotonic_time();
+        if cstr::eq(map_key, key) {
+            return source.mc().lock().update(source.id, key, Some(mapent), age);
+        }
+        if source.lock().flags & MAP_FLAG_FORMAT_AMD == 0 {
+            return CHE_FAIL;
+        }
+        panic!("amd key matching isn't ported yet (phase 2)");
+    }
+
+    /// `lookup_one()`: read the map file for `key`.
+    fn lookup_one(&self, ap: &Arc<AutofsPoint>, source: &Arc<MapSource>, key: &[u8]) -> i32 {
+        let logopt = ap.logopt();
+        let age = sys::monotonic_time();
+        let mc = source.mc();
+        let mut f = match open_map(&self.mapname) {
+            Ok(f) => f,
+            Err(_) => {
+                error!(logopt, "lookup_one", "lookup(file): could not open map file {}", self.mapname);
+                return CHE_FAIL;
+            }
+        };
+        loop {
+            if let Some((mkey, mapent)) = read_one(logopt, &mut f) {
+                if mkey.first() == Some(&b'+') {
+                    let ck = cstr::c(&mkey).to_vec();
+                    debug!(logopt, "lookup_one", "lookup(file): lookup included map {}", ck);
+                    let inc = check_self_include(&ck, &self.mapname);
+                    let Some(inc_source) = self.prepare_plus_include(ap, source, age, &ck, inc) else {
+                        debug!(logopt, "lookup_one", "lookup(file): failed to select included map {}", key);
+                        continue;
+                    };
+                    if lookup::lookup_nss_mount(ap, Some(&inc_source), key) {
+                        return CHE_COMPLETED;
+                    }
+                } else {
+                    let flags = source.lock().flags;
+                    let s_key = if flags & MAP_FLAG_FORMAT_AMD != 0 {
+                        if cstr::eq(&mkey, b"/defaults") {
+                            mc.lock().update(source.id, &mkey, Some(&mapent), age);
+                            continue;
+                        }
+                        sanitize_path(&mkey, mkey.len(), 0, logopt)
+                    } else {
+                        let Some(s) = sanitize_path(&mkey, mkey.len(), ap.ty(), logopt) else { continue };
+                        if key.len() != cstr::c(&s).len() {
+                            continue;
+                        }
+                        Some(s)
+                    };
+                    let Some(s_key) = s_key else { continue };
+                    let ret = self.match_key(source, &s_key, key, &mapent);
+                    if ret == CHE_FAIL {
+                        continue;
+                    }
+                    return ret;
+                }
+            }
+            if f.eof {
+                break;
+            }
+        }
+        CHE_MISSING
+    }
+
+    /// `lookup_wild()`.
+    fn lookup_wild(&self, ap: &Arc<AutofsPoint>, source: &Arc<MapSource>) -> i32 {
+        let logopt = ap.logopt();
+        let age = sys::monotonic_time();
+        let mut f = match open_map(&self.mapname) {
+            Ok(f) => f,
+            Err(_) => {
+                error!(logopt, "lookup_wild", "lookup(file): could not open map file {}", self.mapname);
+                return CHE_FAIL;
+            }
+        };
+        loop {
+            if let Some((mkey, mapent)) = read_one(logopt, &mut f)
+                && mkey == b"*"
+            {
+                return source.mc().lock().update(source.id, b"*", Some(&mapent), age);
+            }
+            if f.eof {
+                break;
+            }
+        }
+        CHE_MISSING
+    }
+
+    /// `check_map_indirect()`.
+    fn check_map_indirect(&self, ap: &Arc<AutofsPoint>, source: &Arc<MapSource>, key: &[u8]) -> i32 {
+        let ret = self.lookup_one(ap, source, key);
+        if ret == CHE_COMPLETED {
+            return NSS_STATUS_COMPLETED;
+        }
+        if ret == CHE_FAIL {
+            return NSS_STATUS_NOTFOUND;
+        }
+        let mc = source.mc();
+        {
+            let mut c = mc.lock();
+            if source.lock().flags & MAP_FLAG_FORMAT_AMD != 0 {
+                panic!("amd key matching isn't ported yet (phase 2)");
+            }
+            if let Some(p) = c.lookup_distinct(key)
+                && c.get(p).source == source.id
+                && ret & CHE_MISSING != 0
+                && c.get(p).mapent.is_some()
+            {
+                let e = c.get_mut(p);
+                e.mapent = None;
+                e.status = 0;
+            }
+        }
+        if ret == CHE_MISSING {
+            let wild = self.lookup_wild(ap, source);
+            {
+                let mut c = mc.lock();
+                if let Some(w) = c.lookup_distinct(b"*")
+                    && c.get(w).source == source.id
+                    && wild & CHE_MISSING != 0
+                {
+                    c.delete(b"*");
+                }
+            }
+            if wild & (CHE_OK | CHE_UPDATED) != 0 {
+                return NSS_STATUS_SUCCESS;
+            }
+        }
+        if ret == CHE_MISSING {
+            return NSS_STATUS_NOTFOUND;
+        }
+        NSS_STATUS_SUCCESS
+    }
+
+    /// `map_update_needed()`: 1 to read the map, 0 not to, -1 if it can't be
+    /// stat()ed.
+    fn map_update_needed(&self, ap: &Arc<AutofsPoint>, source: &Arc<MapSource>) -> i32 {
+        let Some(st) = sys::stat(&self.mapname) else {
+            error!(ap.logopt(), "map_update_needed", "lookup(file): file map {}, could not stat", self.mapname);
+            return -1;
+        };
+        let mut s = source.lock();
+        if st.st_mtime <= self.last_read {
+            if s.instances.is_empty() && s.ty.as_deref().is_some_and(|t| !cstr::eq(t, b"multi")) {
+                return 0;
+            }
+        } else {
+            s.stale = true;
+        }
+        1
+    }
+}
+
+const NSS_STATUS_COMPLETED: i32 = 4;
+
+impl LookupFile {
+    /// `lookup_mount()`.
+    fn mount_impl(&mut self, ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, name: &[u8]) -> i32 {
+        let source = map;
+        let mc = source.mc();
+        let logopt = ap.logopt();
+        let (recurse, depth, flags) = {
+            let s = source.lock();
+            (s.recurse, s.depth, s.flags)
+        };
+        if recurse {
+            return NSS_STATUS_UNAVAIL;
+        }
+        if depth > MAX_INCLUDE_DEPTH {
+            error!(logopt, "lookup_mount", "lookup(file): maximum include depth exceeded {}", self.mapname);
+            return NSS_STATUS_SUCCESS;
+        }
+        debug!(logopt, "lookup_mount", "lookup(file): looking up {}", name);
+        if flags & MAP_FLAG_FORMAT_AMD != 0 {
+            panic!("amd key lookups aren't ported yet (phase 2)");
+        }
+        let key = cstr::c(name).to_vec();
+        if key.len() > KEY_MAX_LEN {
+            return NSS_STATUS_NOTFOUND;
+        }
+        // Check if we recorded a mount fail for this key anywhere.
+        if let Some((mc2, p)) = lookup::lookup_source_mapent(ap, &key, true)
+            && mc2.lock().lookup_negative(p, &key) == CHE_UNAVAIL
+        {
+            return NSS_STATUS_NOTFOUND;
+        }
+        let pref = ap.lock().pref.clone();
+        if ap.ty() == master::LKP_INDIRECT && key.first() != Some(&b'/') {
+            let ret = self.map_update_needed(ap, source);
+            if ret > 0 {
+                let lkp_key = {
+                    let c = mc.lock();
+                    match c.lookup_distinct(&key) {
+                        Some(p) if c.get(p).mm => panic!("multi-mount lookups aren't ported yet (phase 4)"),
+                        _ => match &pref {
+                            None => key.clone(),
+                            Some(pr) => [pr.as_slice(), key.as_slice()].concat(),
+                        },
+                    }
+                };
+                let status = self.check_map_indirect(ap, source, &lkp_key);
+                if status != 0 {
+                    if status == NSS_STATUS_COMPLETED {
+                        return NSS_STATUS_SUCCESS;
+                    }
+                    return NSS_STATUS_NOTFOUND;
+                }
+            }
+        }
+        // do_cache_lookup:
+        let lkp_key = match &pref {
+            None => key.clone(),
+            Some(pr) => [pr.as_slice(), key.as_slice()].concat(),
+        };
+        let (found, mapent) = {
+            let mut c = mc.lock();
+            let me = parse_subs::match_cached_key(ap, source, &mut c, &lkp_key);
+            match me {
+                None => (false, None),
+                Some(p) => {
+                    let e = c.get(p);
+                    let m = if e.mapent.is_some() && (e.source == source.id || e.key.first() == Some(&b'/')) {
+                        e.mapent.clone()
+                    } else {
+                        None
+                    };
+                    (true, m)
+                }
+            }
+        };
+        if !found {
+            return NSS_STATUS_NOTFOUND;
+        }
+        let Some(mapent) = mapent else { return NSS_STATUS_TRYAGAIN };
+        debug!(logopt, "lookup_mount", "lookup(file): {} -> {}", lkp_key, mapent);
+        let mut parse = self.parse.take().expect("parse context");
+        let ret = parse.mount(ap, source, &key, Some(&mapent));
+        self.parse = Some(parse);
+        if ret != 0 {
+            if ap.lock().flags & master::MOUNT_FLAG_REMOUNT != 0 {
+                return NSS_STATUS_TRYAGAIN;
+            }
+            let nt = ap.lock().negative_timeout as i64;
+            mc.lock().update_negative(source.id, &key, nt);
+            return NSS_STATUS_TRYAGAIN;
+        }
+        NSS_STATUS_SUCCESS
+    }
+}
+
 impl LookupMod for LookupFile {
     /// `lookup_reinit()`.
     fn reinit(&mut self, mapfmt: Option<&[u8]>, argv: &Argv) -> i32 {
@@ -576,6 +834,10 @@ impl LookupMod for LookupFile {
         source.lock().age = age;
         self.last_read = sys::time();
         NSS_STATUS_SUCCESS
+    }
+
+    fn mount(&mut self, ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, name: &[u8]) -> i32 {
+        LookupFile::mount_impl(self, ap, map, name)
     }
 
     /// `lookup_done()`.

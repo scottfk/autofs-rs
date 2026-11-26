@@ -305,6 +305,7 @@ impl Grammar for Parse<'_> {
 
 /// `nsswitch_parse()`: the sources of the `automount:` line (or `files` if there
 /// isn't one); `Err(())` (C's 1) if the file can't be read or doesn't parse.
+#[allow(clippy::result_unit_err)]
 pub fn nsswitch_parse(list: &mut Vec<NssSource>) -> Result<(), ()> {
     let data = match sys::read_file(NSSWITCH_FILE) {
         Ok(d) => d,

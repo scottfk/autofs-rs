@@ -7,9 +7,20 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[lib]
+name = "automount"
+path = "src/lib.rs"
+
 [[bin]]
 name = "automount"
 path = "src/main.rs"
+
+# Test driver for the differential tests (not installed): reads the master
+# map and the maps as the daemon does, then looks up keys.
+[[bin]]
+name = "automount-drv"
+path = "src/bin/automount_drv.rs"
+test = false
 
 [dependencies]
 libc.workspace = true

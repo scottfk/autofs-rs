@@ -5,4 +5,5 @@ pub mod lookup;
 pub mod master;
 pub mod master_parse;
 pub mod module;
+pub mod mount;
 pub mod spawn;

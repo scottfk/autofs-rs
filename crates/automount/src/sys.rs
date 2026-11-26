@@ -680,3 +680,42 @@ pub fn host_names() -> Vec<Vec<u8>> {
     }
     out
 }
+
+/// `getpwuid_r()`: (name, home), or `None`.
+pub fn getpwuid(uid: u32) -> Option<(Vec<u8>, Vec<u8>)> {
+    let mut buf = vec![0 as c_char; 16384];
+    // SAFETY: zeroed passwd is a valid out buffer.
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut res: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: valid buffers; the strings are copied before buf goes away.
+    unsafe {
+        let r = libc::getpwuid_r(uid, &mut pw, buf.as_mut_ptr(), buf.len(), &mut res);
+        if r != 0 || res.is_null() {
+            return None;
+        }
+        Some((CStr::from_ptr(pw.pw_name).to_bytes().to_vec(), CStr::from_ptr(pw.pw_dir).to_bytes().to_vec()))
+    }
+}
+
+/// `getgrgid_r()`: the group name, or `None`.
+pub fn getgrgid(gid: u32) -> Option<Vec<u8>> {
+    let mut buf = vec![0 as c_char; 65536];
+    // SAFETY: zeroed group is a valid out buffer.
+    let mut gr: libc::group = unsafe { std::mem::zeroed() };
+    let mut res: *mut libc::group = std::ptr::null_mut();
+    // SAFETY: valid buffers; the string is copied before buf goes away.
+    unsafe {
+        let r = libc::getgrgid_r(gid, &mut gr, buf.as_mut_ptr(), buf.len(), &mut res);
+        if r != 0 || res.is_null() {
+            return None;
+        }
+        Some(CStr::from_ptr(gr.gr_name).to_bytes().to_vec())
+    }
+}
+
+/// `mkdir(path, mode)`.
+pub fn mkdir(path: &[u8], mode: u32) -> i32 {
+    let p = cstring(path);
+    // SAFETY: p is a valid C string.
+    unsafe { libc::mkdir(p.as_ptr(), mode) }
+}

@@ -22,18 +22,96 @@ pub trait LookupMod: Send + std::fmt::Debug {
     fn reinit(&mut self, mapfmt: Option<&[u8]>, argv: &Argv) -> i32;
     fn read_master(&mut self, master: &Arc<Master>, age: i64) -> i32;
     fn read_map(&mut self, ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, age: i64) -> i32;
+    /// `lookup_mount()`.
+    fn mount(&mut self, _ap: &Arc<AutofsPoint>, _map: &Arc<MapSource>, name: &[u8]) -> i32 {
+        panic!("lookup_mount for {} isn't ported yet", String::from_utf8_lossy(name));
+    }
     fn done(self: Box<Self>) -> i32;
 }
 
 /// A parse module's entry points.
 pub trait ParseMod: Send + std::fmt::Debug {
     fn reinit(&mut self, argv: &Argv) -> i32;
+    /// `parse_mount()`.
+    fn mount(&mut self, _ap: &Arc<AutofsPoint>, _map: &Arc<MapSource>, _name: &[u8], _mapent: Option<&[u8]>) -> i32 {
+        panic!("parse_mount isn't ported yet for this format (phase 2)");
+    }
     fn done(self: Box<Self>) -> i32;
 }
 
 /// A mount module's entry points.
 pub trait MountMod: Send + std::fmt::Debug {
+    /// `mount_mount()`.
+    fn mount(
+        &mut self,
+        _ap: &Arc<AutofsPoint>,
+        _root: &[u8],
+        _name: &[u8],
+        _what: Option<&[u8]>,
+        _fstype: &[u8],
+        _options: Option<&[u8]>,
+    ) -> i32 {
+        panic!("mount_mount isn't ported yet (phases 3-5)");
+    }
     fn done(self: Box<Self>) -> i32;
+}
+
+/// The test driver's switch: open recording mount modules instead of the real
+/// ones (`automount-drv`; the C driver gets the same from fake `.so` files).
+pub static FAKE_MOUNTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A recording mount module: logs what it's asked to do and succeeds.
+#[derive(Debug)]
+pub struct FakeMount {
+    name: Vec<u8>,
+}
+
+fn fake_log(s: &[u8]) {
+    let mut m = s.to_vec();
+    m.push(b'\n');
+    crate::sys::write_stderr(&m);
+}
+
+impl MountMod for FakeMount {
+    fn mount(
+        &mut self,
+        _ap: &Arc<AutofsPoint>,
+        root: &[u8],
+        name: &[u8],
+        what: Option<&[u8]>,
+        fstype: &[u8],
+        options: Option<&[u8]>,
+    ) -> i32 {
+        use crate::daemon::master::cstr_or_null;
+        fake_log(&bfmt!(
+            "fake mount({}): root={} name={} what={} fstype={} options={}",
+            self.name,
+            root,
+            name,
+            cstr_or_null(&what.map(|w| w.to_vec())),
+            fstype,
+            cstr_or_null(&options.map(|o| o.to_vec()))
+        ));
+        0
+    }
+
+    fn done(self: Box<Self>) -> i32 {
+        fake_log(&bfmt!("fake mount({}): done", self.name));
+        0
+    }
+}
+
+/// The mount modules upstream's build has (`mount_*.so`, with the symlinks).
+const MOUNT_MODULES: [&[u8]; 10] =
+    [b"nfs", b"nfs4", b"bind", b"generic", b"autofs", b"ext2", b"ext3", b"ext4", b"afs", b"changer"];
+
+/// The file a mount module name opens (the compatibility names are symlinks).
+fn mount_file_name(name: &[u8]) -> &[u8] {
+    match name {
+        b"nfs4" => b"nfs",
+        b"ext3" | b"ext4" => b"ext2",
+        n => n,
+    }
 }
 
 /// `dlerror()` for a module file that doesn't exist.
@@ -146,6 +224,11 @@ pub fn close_parse(m: Box<dyn ParseMod>) -> i32 {
 
 /// `open_mount()`.
 pub fn open_mount(name: &[u8], err_prefix: Option<&[u8]>) -> Option<Box<dyn MountMod>> {
+    if FAKE_MOUNTS.load(std::sync::atomic::Ordering::Relaxed) && MOUNT_MODULES.contains(&cstr::c(name)) {
+        let n = mount_file_name(cstr::c(name));
+        fake_log(&bfmt!("fake mount({}): init", n));
+        return Some(Box::new(FakeMount { name: n.to_vec() }));
+    }
     match cstr::c(name) {
         b"nfs" | b"nfs4" => modules::mount_nfs::mount_init().map(|m| Box::new(m) as Box<dyn MountMod>),
         b"bind" => modules::mount_bind::mount_init().map(|m| Box::new(m) as Box<dyn MountMod>),

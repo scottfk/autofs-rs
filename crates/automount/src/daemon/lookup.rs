@@ -1,5 +1,6 @@
 //! `daemon/lookup.c`: nsswitch semantics for reading the master map and the
-//! maps. (Mount lookups come with the daemon, in phase 3.)
+//! maps, and for looking keys up (`lookup_nss_mount()`), with the negative
+//! cache and the browse directories (`lookup_ghost()`).
 
 use std::sync::Arc;
 
@@ -455,4 +456,391 @@ pub fn lookup_prune_cache(ap: &Arc<AutofsPoint>, age: i64) -> bool {
         map.lock().stale = false;
     }
     true
+}
+
+/// `lookup_source_mapent()`: the first map source's cache entry for `key`
+/// (`distinct`: no wildcard), with the cache it's in.
+pub fn lookup_source_mapent(
+    ap: &Arc<AutofsPoint>,
+    key: &[u8],
+    distinct: bool,
+) -> Option<(Arc<crate::libautofs::cache::Cache>, crate::libautofs::cache::Pos)> {
+    for map in ap.entry().maps() {
+        let mc = map.mc();
+        let p = {
+            let c = mc.lock();
+            if distinct { c.lookup_distinct(key) } else { c.lookup(key) }
+        };
+        if let Some(p) = p {
+            return Some((mc, p));
+        }
+    }
+    None
+}
+
+/// `do_lookup_mount()`.
+pub fn do_lookup_mount(ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, name: &[u8]) -> i32 {
+    if map.lock().lookup.is_none() {
+        let (ty, format, argv) = {
+            let m = map.lock();
+            (m.ty.clone().unwrap_or_default(), m.format.clone(), m.argv.clone())
+        };
+        match module::open_lookup(&ty, Some(b""), format.as_deref(), &argv) {
+            Ok(l) => map.lock().lookup = Some(l),
+            Err(status) => {
+                debug!(ap.logopt(), "do_lookup_mount", "lookup module {} open failed", ty);
+                return status;
+            }
+        }
+    }
+    let mut l = map.lock().lookup.take().unwrap();
+    let status = l.mount(ap, map, name);
+    map.lock().lookup = Some(l);
+    status
+}
+
+/// `lookup_name_file_source_instance()`.
+fn lookup_name_file_source_instance(ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, name: &[u8]) -> i32 {
+    let logopt = ap.logopt();
+    let age = sys::monotonic_time();
+    if name.first() == Some(&b'/') && map.lock().flags & MAP_FLAG_FORMAT_AMD != 0 {
+        panic!("amd host instance lookups aren't ported yet (phase 2)");
+    }
+    if map.argv().is_empty() {
+        error!(logopt, "lookup_name_file_source_instance", "invalid arguments for autofs_point");
+        return NSS_STATUS_UNKNOWN;
+    }
+    let Some(path) = find_map_path(ap, map) else { return NSS_STATUS_UNKNOWN };
+    let Some(st) = sys::stat(&path) else {
+        debug!(logopt, "lookup_name_file_source_instance", "file map not found");
+        return NSS_STATUS_NOTFOUND;
+    };
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return NSS_STATUS_NOTFOUND;
+    }
+    let ty: &[u8] = if st.st_mode & libc::S_IEXEC != 0 { b"program" } else { b"file" };
+    let format = map.format();
+    let instance = match master::master_find_source_instance(map, Some(ty), format.as_deref(), None) {
+        Some(i) => i,
+        None => {
+            let mut argv = map.argv();
+            argv[0] = Some(path);
+            let i = master::master_add_source_instance(map, Some(ty), format.as_deref(), age, &argv);
+            let (recurse, depth) = {
+                let m = map.lock();
+                (m.recurse, m.depth)
+            };
+            let mut il = i.lock();
+            il.recurse = recurse;
+            il.depth = depth;
+            drop(il);
+            i
+        }
+    };
+    do_lookup_mount(ap, &instance, name)
+}
+
+/// `lookup_name_source_instance()`.
+fn lookup_name_source_instance(ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, ty: &[u8], name: &[u8]) -> i32 {
+    let age = sys::monotonic_time();
+    if name.first() == Some(&b'/') && map.lock().flags & MAP_FLAG_FORMAT_AMD != 0 {
+        panic!("amd host instance lookups aren't ported yet (phase 2)");
+    }
+    let format = map.format();
+    let instance = match master::master_find_source_instance(map, Some(ty), format.as_deref(), None) {
+        Some(i) => i,
+        None => {
+            let argv = map.argv();
+            let i = master::master_add_source_instance(map, Some(ty), format.as_deref(), age, &argv);
+            let (recurse, depth) = {
+                let m = map.lock();
+                (m.recurse, m.depth)
+            };
+            let mut il = i.lock();
+            il.recurse = recurse;
+            il.depth = depth;
+            drop(il);
+            i
+        }
+    };
+    do_lookup_mount(ap, &instance, name)
+}
+
+/// `do_name_lookup_mount()`.
+fn do_name_lookup_mount(ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, name: &[u8]) -> i32 {
+    let (ty, a0, flags) = {
+        let m = map.lock();
+        (m.ty.clone().unwrap_or_default(), args::arg(&m.argv, 0).map(|a| a.to_vec()), m.flags)
+    };
+    let Some(a0) = a0 else {
+        if cstr::eq(&ty, b"hosts") {
+            return do_lookup_mount(ap, map, name);
+        }
+        return NSS_STATUS_UNKNOWN;
+    };
+    if name.first() == Some(&b'/') && flags & MAP_FLAG_FORMAT_AMD != 0 {
+        panic!("amd host instance lookups aren't ported yet (phase 2)");
+    }
+    if !cstr::neq(&ty, b"file", 4) || a0.first() == Some(&b'/') {
+        return do_lookup_mount(ap, map, name);
+    }
+    let Some(path) = find_map_path(ap, map) else { return NSS_STATUS_UNKNOWN };
+    map.lock().argv[0] = Some(path);
+    do_lookup_mount(ap, map, name)
+}
+
+/// `lookup_map_name()`.
+fn lookup_map_name(this: &nsswitch::NssSource, ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, name: &[u8]) -> i32 {
+    if !cstr::caseeq(&this.source, b"files") {
+        return lookup_name_source_instance(ap, map, &this.source, name);
+    }
+    let a0 = args::arg(&map.argv(), 0).unwrap_or(b"").to_vec();
+    if cstr::strchr(&a0, b'/').is_some() {
+        error!(ap.logopt(), "lookup_map_name", "relative path invalid in files map name");
+        return NSS_STATUS_NOTFOUND;
+    }
+    lookup_name_file_source_instance(ap, map, name)
+}
+
+/// `lookup_get_map_source()`.
+fn lookup_get_map_source(ap: &Arc<AutofsPoint>) -> Option<Arc<MapSource>> {
+    let map = ap.entry().maps().first()?.clone();
+    let (ty, a0, format) = {
+        let m = map.lock();
+        (m.ty.clone(), args::arg(&m.argv, 0).map(|a| a.to_vec()), m.format.clone())
+    };
+    let a0 = a0.unwrap_or_default();
+    if ty.is_some() || a0.first() != Some(&b'/') || a0.get(1) == Some(&b'/') {
+        return Some(map);
+    }
+    let st = sys::stat(&a0)?;
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return None;
+    }
+    let t: &[u8] = if st.st_mode & libc::S_IEXEC != 0 { b"program" } else { b"file" };
+    master::master_find_source_instance(&map, Some(t), format.as_deref(), None)
+}
+
+/// `update_negative_cache()`.
+fn update_negative_cache(ap: &Arc<AutofsPoint>, source: Option<&Arc<MapSource>>, name: &[u8]) {
+    if let Some(s) = source
+        && s.lock().depth > 0
+    {
+        return;
+    }
+    if name == b"*" {
+        return;
+    }
+    if lookup_source_mapent(ap, name, true).is_some() {
+        return;
+    }
+    if defaults::defaults_disable_not_found_message() == 0 {
+        logmsg!("key \"{}\" not found in map source(s).", name);
+    }
+    let map = match source {
+        Some(s) => Some(s.clone()),
+        None => lookup_get_map_source(ap),
+    };
+    if let Some(map) = map {
+        let now = sys::monotonic_time();
+        let nt = ap.lock().negative_timeout as i64;
+        let mc = map.mc();
+        let mut c = mc.lock();
+        let rv = match c.lookup_distinct(name) {
+            Some(p) => c.push_mapent(p, None),
+            None => c.update(map.id, name, None, now),
+        };
+        if rv != crate::libautofs::cache::CHE_FAIL
+            && let Some(p) = c.lookup_distinct(name)
+        {
+            c.get_mut(p).status = now + nt;
+        }
+    }
+}
+
+/// `lookup_nss_mount()`: true (C's nonzero) if the key was mounted.
+pub fn lookup_nss_mount(ap: &Arc<AutofsPoint>, source: Option<&Arc<MapSource>>, name: &[u8]) -> bool {
+    let logopt = ap.logopt();
+    let entry = ap.entry();
+    fn tail_in(list: &[Arc<MapSource>], s: &Arc<MapSource>) -> Option<Vec<Arc<MapSource>>> {
+        if let Some(i) = list.iter().position(|m| Arc::ptr_eq(m, s)) {
+            return Some(list[i..].to_vec());
+        }
+        list.iter().find_map(|m| tail_in(&m.instances(), s))
+    }
+    let maps: Vec<Arc<MapSource>> = match source {
+        Some(s) => tail_in(&entry.maps(), s).unwrap_or_else(|| vec![s.clone()]),
+        None => entry.maps(),
+    };
+    let entry_age = entry.lock().age;
+    let mut result = NSS_STATUS_UNKNOWN;
+    let mut i = 0;
+    'maps: while i < maps.len() {
+        let map = &maps[i];
+        let (mage, ty, a0, flags) = {
+            let m = map.lock();
+            (m.age, m.ty.clone(), args::arg(&m.argv, 0).map(|a| a.to_vec()), m.flags)
+        };
+        if entry_age > mage {
+            i += 1;
+            continue;
+        }
+        if ty.is_some() {
+            result = do_name_lookup_mount(ap, map, name);
+            if result == NSS_STATUS_SUCCESS {
+                break;
+            }
+            i += 1;
+            continue;
+        }
+        let a0 = a0.unwrap_or_default();
+        if a0.first() == Some(&b'/') {
+            if a0.get(1) == Some(&b'/') {
+                map.lock().ty = Some(b"ldap".to_vec());
+                result = do_lookup_mount(ap, map, name);
+            } else {
+                result = lookup_name_file_source_instance(ap, map, name);
+            }
+            if result == NSS_STATUS_SUCCESS {
+                break;
+            }
+            i += 1;
+            continue;
+        }
+        let mut nsslist = Vec::new();
+        if nsswitch::nsswitch_parse(&mut nsslist).is_err() {
+            error!(logopt, "lookup_nss_mount", "can't to read name service switch config.");
+            result = 1;
+            break;
+        }
+        for this in &nsslist {
+            if flags & MAP_FLAG_FORMAT_AMD != 0 && cstr::eq(&this.source, b"sss") {
+                warn!(logopt, "source sss is not available for amd maps.");
+                result = NSS_STATUS_UNAVAIL;
+                continue;
+            }
+            result = lookup_map_name(this, ap, map, name);
+            if result == NSS_STATUS_UNKNOWN {
+                continue;
+            }
+            if nsswitch::check_nss_result(this, result) >= 0 {
+                break 'maps;
+            }
+        }
+        i += 1;
+    }
+    // ap->state is ST_INIT outside the daemon: no map update request.
+    if result == NSS_STATUS_NOTFOUND || result == NSS_STATUS_UNAVAIL {
+        update_negative_cache(ap, source, name);
+    }
+    result == 0
+}
+
+/// `make_browse_path()`.
+fn make_browse_path(root: &[u8], key: &[u8], prefix: Option<&[u8]>) -> Option<Vec<u8>> {
+    let mut k = key;
+    if let Some(p) = prefix {
+        if p.len() > key.len() || !key.starts_with(p) {
+            return None;
+        }
+        k = &key[p.len()..];
+    }
+    if cstr::strchr(k, b'/').is_some() {
+        return None;
+    }
+    if root.len() + k.len() > 255 {
+        return None;
+    }
+    let mut path = root.to_vec();
+    path.push(b'/');
+    path.extend_from_slice(k);
+    Some(path)
+}
+
+/// `mkdir_path()`: each component that doesn't exist, with `mode`.
+pub fn mkdir_path(path: &[u8], mode: u32) -> Result<(), i32> {
+    let mut i = 1;
+    while i <= path.len() {
+        if i == path.len() || path[i] == b'/' {
+            let comp = &path[..i];
+            if sys::stat(comp).is_some() {
+                if i == path.len() {
+                    let st = sys::stat(comp).unwrap();
+                    return Err(if st.st_mode & libc::S_IFMT == libc::S_IFDIR { libc::EEXIST } else { libc::ENOTDIR });
+                }
+            } else if sys::mkdir(comp, mode) != 0 {
+                let e = sys::errno();
+                if i == path.len() {
+                    return Err(e);
+                }
+            }
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+/// `lookup_ghost()`: make the browse directories of an indirect map.
+pub fn lookup_ghost(ap: &Arc<AutofsPoint>) -> u32 {
+    let path = ap.path();
+    if path == b"/-" {
+        return 0x0001 | master::LKP_DIRECT;
+    }
+    let (flags, logopt, pref) = {
+        let a = ap.lock();
+        (a.flags, a.logopt, a.pref.clone())
+    };
+    if flags & master::MOUNT_FLAG_GHOST == 0 {
+        return LKP_INDIRECT;
+    }
+    let entry = ap.entry();
+    let entry_age = entry.lock().age;
+    for map in entry.maps() {
+        if entry_age > map.lock().age {
+            continue;
+        }
+        let amd = map.lock().flags & MAP_FLAG_FORMAT_AMD != 0;
+        let mc = map.mc();
+        let mut c = mc.lock();
+        let mut p = c.enumerate(None);
+        while let Some(pos) = p {
+            let (key, mapent, mm) = {
+                let e = c.get(pos);
+                (e.key.clone(), e.mapent.clone(), e.mm)
+            };
+            let skip = match &mapent {
+                None => true,
+                Some(m) => {
+                    if cstr::strchr(&key, b'*').is_some() {
+                        true
+                    } else if key.first() == Some(&b'/') {
+                        if !amd && mm {
+                            error!(logopt, "lookup_ghost", "invalid key {}", key);
+                        }
+                        true
+                    } else {
+                        crate::libautofs::parse_subs::starts_with_null_opt(m)
+                    }
+                }
+            };
+            if !skip && let Some(full) = make_browse_path(&path, &key, pref.as_deref()) {
+                let mp_mode = 0o755;
+                match mkdir_path(&full, mp_mode) {
+                    Err(e) if e != libc::EEXIST => {
+                        warn!(logopt, "mkdir_path {} failed: {}", full, sys::strerror(e));
+                    }
+                    Err(_) => {}
+                    Ok(()) => {
+                        if let Some(st) = sys::stat(&full) {
+                            let e = c.get_mut(pos);
+                            e.dev = st.st_dev;
+                            e.ino = st.st_ino;
+                        }
+                    }
+                }
+            }
+            p = c.enumerate(Some(pos));
+        }
+    }
+    LKP_INDIRECT
 }

@@ -26,6 +26,7 @@ pub const LKP_DIRECT: u32 = 0x0004;
 pub const MAP_FLAG_FORMAT_AMD: u32 = 0x0001;
 
 pub const MOUNT_FLAG_GHOST: u32 = 0x0001;
+pub const MOUNT_FLAG_REMOUNT: u32 = 0x0008;
 pub const MOUNT_FLAG_RANDOM_SELECT: u32 = 0x0004;
 pub const MOUNT_FLAG_USE_WEIGHT_ONLY: u32 = 0x0010;
 pub const MOUNT_FLAG_NOBIND: u32 = 0x0020;
