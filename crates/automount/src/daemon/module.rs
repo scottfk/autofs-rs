@@ -99,7 +99,7 @@ pub fn close_lookup(m: Box<dyn LookupMod>) -> i32 {
 pub fn open_parse(name: &[u8], err_prefix: Option<&[u8]>, argv: &Argv) -> Option<Box<dyn ParseMod>> {
     match cstr::c(name) {
         b"sun" => modules::parse_sun::parse_init(argv).map(|m| Box::new(m) as Box<dyn ParseMod>),
-        b"amd" => panic!("parse module amd isn't ported yet (phase 2)"),
+        b"amd" => modules::parse_amd::parse_init(argv).map(|m| Box::new(m) as Box<dyn ParseMod>),
         _ => {
             if let Some(p) = err_prefix {
                 logerr!(

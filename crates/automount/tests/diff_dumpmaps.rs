@@ -132,7 +132,9 @@ const MASTER_LINES: &[&str] = &[
     "/q multi file_this_name_is_long_ok -- /etc/autofs/auto.b",
     "/r file /etc/autofs/auto.a",
     "/r file  :  /etc/autofs/auto.a",
-    // amd maps come with parse_amd in phase 2.
+    "/r file,amd:/etc/autofs/auto.amd",
+    "/r file,amd:auto.amd",
+    "/r program,amd:/etc/autofs/auto.a",
     "/s/ /etc/autofs/auto.a",
     "/ /etc/autofs/auto.a",
     "// /etc/autofs/auto.a",
@@ -148,10 +150,14 @@ fn dump_master_lines() {
             Case::new(&format!("master_line_{i}"), &["-d", "-m"])
                 .etc_bytes("autofs/auto.master", format!("{line}\n").as_bytes())
                 .map("auto.a", "k v\n")
-                .map("auto.b", "l w\n"),
+                .map("auto.b", "l w\n")
+                .map("auto.amd", AMD_MAP),
         );
     }
 }
+
+const AMD_MAP: &str =
+    "/defaults type:=nfs;opts:=rw\nk1 rhost:=s1;rfs:=/x\nsub/dir type:=link;fs:=/tmp\n* type:=nfs;rhost:=${key}\n";
 
 #[test]
 fn dump_master_lines_after_error() {
@@ -162,7 +168,8 @@ fn dump_master_lines_after_error() {
             Case::new(&format!("master_after_{i}"), &["-d", "-m"])
                 .etc_bytes("autofs/auto.master", format!("{line}\n/z /etc/autofs/auto.a -ro\n/y auto.b\n").as_bytes())
                 .map("auto.a", "k v\n")
-                .map("auto.b", "l w\n"),
+                .map("auto.b", "l w\n")
+                .map("auto.amd", AMD_MAP),
         );
     }
 }
@@ -593,5 +600,19 @@ fn dump_nsswitch_error_recovery() {
             .etc("nsswitch.conf", "automount: [ [ [ files\n")
             .master("/a auto.a\n")
             .map("auto.a", "k v\n"),
+    );
+}
+
+#[test]
+fn dump_amd_sections() {
+    check(
+        Case::new("amd_sections", &["-d", "-m"])
+            .conf(
+                "[ amd ]\nbrowsable_dirs = yes\nlog_options = all\nsearch_path = /etc/autofs/amd:/etc/autofs\n\
+                 [ /amd1 ]\nmap_name = auto.amd\nmap_type = file\n[ /amd2 ]\nmap_options = cache:=all\n",
+            )
+            .master("/amd1 auto.amd\n/amd2 /etc/autofs/auto.amd\n/amd3 file,amd:auto.inamd\n")
+            .map("auto.amd", AMD_MAP)
+            .map("amd/auto.inamd", "a type:=nfs\n"),
     );
 }

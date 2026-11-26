@@ -8,4 +8,5 @@ pub mod lookup_program;
 pub mod lookup_yp;
 pub mod mount_bind;
 pub mod mount_nfs;
+pub mod parse_amd;
 pub mod parse_sun;
