@@ -1,0 +1,92 @@
+# Upstream quirks, kept on purpose
+
+autofs-rs reproduces autofs **5.1.9** (with Gentoo's c99 patch, libtirpc 1.3.7 and glibc),
+as Gentoo builds it, exactly, including behavior that looks like a bug. Each item here is
+marked `QUIRK` in the source, or described where the code follows C step by step. Fixing
+one is a deliberate, separate change (ideally upstream as well), not something to slip
+into the port. Quirks of the shared `tirpc` crate are listed in rpcbind-rs's QUIRKS.md.
+
+Severity: **high** means someone who can name a path in a mount point, write a map or
+answer an RPC can get mounts, data or crashes they shouldn't; **medium** means it's
+surprising and user-visible; **low** means it's cosmetic or hard to hit.
+
+The last section lists where the port can't or doesn't follow C, and why.
+
+## Logging (lib/log.c)
+
+| Severity | Quirk | Where | Test |
+|---|---|---|---|
+| low | Every logging function sends its message to syslog at `LOG_INFO`, whatever its level, unless the message carries a mount request id prefix (`use_mount_request_log_id`); only then does the level count. | `log::emit` | (syslog comes with the daemon, phase 3) |
+| low | `main()` reports a failed `setrlimit()` with `printf()` and no newline, so the message runs into whatever comes next on stdout (`--dumpmaps`' header, or the second such message). | `automount::main` | `dump_basic`, `core_limit` |
+
+## Configuration (lib/defaults.c)
+
+| Severity | Quirk | Where | Test |
+|---|---|---|---|
+| medium | `uname()`'s result is tested the wrong way round, so when it works the amd defaults `arch`, `karch`, `os` and `osver` are set to nothing (and the `${arch}`-style macros built from them are missing). `autofs_use_lofs` gets `auto_dir`'s default (`/a`). | `ConfCache::load_amd_defaults` | (amd maps: phase 2) |
+| medium | Lines that don't start with a letter or `[` are ignored, indented ones included: `  timeout = 5` does nothing. | `defaults::parse_line` | `dump_conf_indented` |
+| low | Lines are read 256 bytes at a time, so a longer line is parsed as several and the "was truncated, ignored" message can never appear. | `defaults::fgets_chunks` | - |
+| low | The "neither file has changed" test can never be true (`stat = fstat(...) != -1` assigns the comparison), so both files are reread every time the configuration is read. | `defaults_read_config` | - |
+| low | Settings with defaults (`timeout`, `logging`, `browse_mode`...) are exported to the environment under their own names (`setenv("timeout", "600", 0)`), where programs autofs runs see them, and an environment variable of that name overrides both the default and the file. | `ConfCache::add`, `update` | `dump_conf_env` |
+
+## Macros (lib/macros.c, lib/mounts.c)
+
+| Severity | Quirk | Where | Test |
+|---|---|---|---|
+| low | The amd `cluster` default looks up `domain` with a length of 4, which no variable matches, so it's never set from the domain. | `macros::add_std_amd_vars` | - |
+| low | `macro_free_global_table()` resets the table to start at `OSVERS`, so `hostd`, `domain`, `xhost`, `host`, `byte`, `false`, `true` and `dollar` are gone after it. | `macros::macro_free_global_table` | - |
+
+## The map entry cache (lib/cache.c)
+
+| Severity | Quirk | Where | Test |
+|---|---|---|---|
+| medium | Caching a second entry for a key (from another map source) links it after the key's last entry with `existing->next = me`, dropping whatever followed that entry in the hash chain: other keys that hashed to the same bucket disappear from the cache. | `CacheInner::add` | `dump_small_hash_table` |
+| low | `map_hash_table_size = 0` divides by zero (`SIGFPE`) on the first key. | `cache::hash` | `dump_zero_hash_table` |
+| low | `cache_lookup_key_next()` tests the entry it started from instead of the one it's looking at, so for a multi-mount entry that isn't the root it loops forever. | `CacheInner::lookup_key_next` | - |
+
+## The master map (daemon/master_tok.l, daemon/master_parse.y, daemon/master.c)
+
+| Severity | Quirk | Where | Test |
+|---|---|---|---|
+| medium | The scanner's start state survives a rejected entry: after a syntax error part way through a line, the next line is scanned in whatever state the scanner was left in (and can be rejected for no reason of its own). Only `-xfn` resets it on purpose. | `master_parse` (the scanner state is global, as in C) | `dump_master_lines_after_error` |
+| low | Tokens that don't set a value (`OPT_TIMEOUT`, `COMMA`...) carry whatever the last token left in `master_lval`, and some error messages print that. | `master_parse::Val` | `dump_master_lines` |
+| medium | A `multi` entry whose format is `hesiod` frees the parsed path twice (in the action, then in `master_parse_entry()`): glibc stops with "free(): double free detected in tcache 2" and `SIGABRT`. | `State::local_free_vars` | `dump_master_multi_hesiod_crash` |
+| medium | `-hosts` or `-null` in a `multi` map list makes `append_argv()` read through a NULL vector: `SIGSEGV`. | `Parse::add_multi_mapstr` | `dump_master_lines` (`/q multi -hosts`) |
+| low | A map name, type or option of 2048 bytes or more, or a `multi`/map type that doesn't fit the scanner's 1024-byte buffer, trips `_FORTIFY_SOURCE` ("*** buffer overflow detected ***", `SIGABRT`). | `Val::set`, the `{MULTI}`/`{MTYPE}` actions | - |
+| low | `--dumpmaps TYPE NAME MASTER` ignores `MASTER`: both branches of the test create the master list with the default name. | `automount::main` | - |
+| low | The old-style `type:name` test for `sss` uses `\|\|` where the others use `&&`, so any master map name with `,` or `:` as its fourth character is read as `source:name`. | `lookup::lookup_nss_read_master` | - |
+| low | An included map (`+name` in a map) is read, and then so are the maps included before it in the same map (C walks the instance list from the new instance onward). They're already cached, so only `--debug` and `--verbose` output shows it. | `lookup::lookup_nss_read_map` | `dump_map_include` |
+
+## nsswitch.conf (lib/nss_tok.l, lib/nss_parse.y)
+
+| Severity | Quirk | Where | Test |
+|---|---|---|---|
+| medium | The `[STATUS=action]` table is a global that is never reset: each source with brackets gets every action seen so far on the line, and on earlier reads. | `nsswitch::State::act` | `dump_nsswitch_actions_carry_over` |
+| low | A parse that's abandoned part way leaves the rest of its buffer in the scanner; the next read of `nsswitch.conf` scans that first, then the file again. | `nsswitch::State::scanner` | `dump_nsswitch_errors` |
+| low | Characters the `automount:` line's rules don't cover (`#`, `!`, `\|`, `=` outside brackets) are logged on a line of their own by flex's default rule, and the rest of a comment is read as sources ("ignored unsupported autofs nsswitch source"). | `Parse::lex` (rule 16) | `dump_nsswitch`, `dump_nsswitch_echo_and_long` |
+| low | The syntax error message has an extra newline (a blank line on stderr). A source name of 128 bytes or more trips `_FORTIFY_SOURCE` and aborts. | `nsswitch::nss_error`, `Val::set` | `dump_nsswitch_errors`, `dump_nsswitch_echo_and_long` |
+
+## File maps (modules/lookup_file.c, lib/parse_subs.c)
+
+| Severity | Quirk | Where | Test |
+|---|---|---|---|
+| medium | Keys with a byte of 128 or more are dropped: `sanitize_path()` compares a signed `char` with 32. | `parse_subs::sanitize_path` | `dump_non_ascii_keys` |
+| low | `sanitize_path()` never removes a trailing `/` from a key (its test measures the string past its end). | `parse_subs::sanitize_path` | `dump_map_scanner` |
+| low | A line that starts with a blank after an entry continues it, but `read_one()` reads the continuation without keeping it; anything but blanks on it makes the whole entry a "bad map entry". | `lookup_file::read_one` | `dump_map_scanner` |
+
+## Startup (daemon/automount.c, lib/mounts.c)
+
+| Severity | Quirk | Where | Test |
+|---|---|---|---|
+| low | `check_nfs_mount_version()` only looks for the nfs-utils version in output without a trailing newline, and `mount.nfs -V` ends its line with one, so `nfs_mount_uses_string_options` is always 0. | `automount::check_nfs_mount_version` | every case (`mount.nfs -V` is run and recorded) |
+| low | `-V` lists `LIBXML2_WORKAROUND`, which `config.h` defines even without LDAP. | `automount::show_build_info` | `opt_version` |
+| low | Opening the `sun` parser (for any map) opens the NFS and bind mount modules, and the bind module checks that bind mounts work by mounting one `/tmp/autoXXXXXX` directory on another, even for `--dumpmaps`. | `mount_bind::mount_init` | every dump case (`cmds`) |
+
+## Where the port differs
+
+| What | Why |
+|---|---|
+| The modules are built in: there are no `/usr/lib64/autofs/*.so` files or `libautofs.so`, and a map type without a module fails with the message `dlopen()` would give for the missing file. | Every module hydra has comes from autofs itself (see the README). |
+| `-Dname` without `=` is ignored. C's `macro_parse_globalvar()` walks off the end of its stack buffer looking for the `=`. | Undefined behavior; there's nothing to match. |
+| The master map scanner's 1024-byte `buff` grows instead of overrunning into the variables after it, and the scanner's own `master_error()` logs an empty line where C prints whatever a register held (`logmsg("%s")` without an argument; only for tokens over 2048 bytes). | Memory corruption and an uninitialized read; the hostile input phase looks at what the overrun does in the reference binary. |
+| `is_mounted()` reads the mount table instead of trying the `/dev/autofs` `ISMOUNTPOINT` ioctl first. | The ioctl needs `CAP_SYS_ADMIN`, so C falls back to the table without it too; the ioctl layer comes with the daemon (phase 3). |

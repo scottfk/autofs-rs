@@ -1,0 +1,21 @@
+[package]
+name = "automount"
+description = "Drop-in Rust port of the Linux automounter (autofs 5)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "automount"
+path = "src/main.rs"
+
+[dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+libc.workspace = true

@@ -63,7 +63,14 @@ make reference      # build the C reference at the pinned release into ../autofs
 make check          # build the reference if needed and run everything
 make clippy         # cargo clippy --all-targets -D warnings
 make fmt            # cargo fmt
+make tables         # regenerate the grammar tables from the reference build
 ```
+
+The scanners and parsers run flex's and bison's tables through Rust copies of their
+skeletons (see the README). The tables in `crates/automount/src/tables/` are generated
+by `tools/gen-tables.py` from the C that flex and bison write when the reference is
+built; don't edit them, and regenerate them after a reference bump. A change to a
+grammar's behavior goes in its rule actions, next to the grammar.
 
 **Before sending a PR, please make sure `make check`, `make clippy` and `make fmt` are
 clean.**
