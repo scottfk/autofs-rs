@@ -152,8 +152,8 @@ impl LookupProgram {
             if fd0 == -1 && fd1 == -1 {
                 break;
             }
-            let hup = (libc::POLLIN | libc::POLLHUP) as i16;
-            if rev0 & hup == libc::POLLHUP as i16 && rev1 & hup == libc::POLLHUP as i16 {
+            let hup = libc::POLLIN | libc::POLLHUP;
+            if rev0 & hup == libc::POLLHUP && rev1 & hup == libc::POLLHUP {
                 break;
             }
             if rev0 != 0 {
