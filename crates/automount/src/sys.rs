@@ -804,3 +804,30 @@ pub fn poll2(a: Fd, b: Fd) -> (i32, i16, i16) {
     let r = unsafe { libc::poll(p.as_mut_ptr(), 2, -1) };
     (r, p[0].revents, p[1].revents)
 }
+
+/// `getpwnam(name)->pw_dir`.
+pub fn getpwnam_home(name: &[u8]) -> Option<Vec<u8>> {
+    let n = cstring(name);
+    // SAFETY: n is a valid C string; the result is copied at once.
+    unsafe {
+        let pw = libc::getpwnam(n.as_ptr());
+        if pw.is_null() {
+            return None;
+        }
+        Some(CStr::from_ptr((*pw).pw_dir).to_bytes().to_vec())
+    }
+}
+
+/// `chdir(path)`.
+pub fn chdir(path: &[u8]) -> i32 {
+    let p = cstring(path);
+    // SAFETY: p is a valid C string.
+    unsafe { libc::chdir(p.as_ptr()) }
+}
+
+/// `symlink(target, link)`.
+pub fn symlink(target: &[u8], link: &[u8]) -> i32 {
+    let (t, l) = (cstring(target), cstring(link));
+    // SAFETY: valid C strings.
+    unsafe { libc::symlink(t.as_ptr(), l.as_ptr()) }
+}

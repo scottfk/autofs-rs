@@ -159,6 +159,17 @@ impl LookupMod for LookupMulti {
         if !at_least_1 { NSS_STATUS_NOTFOUND } else { NSS_STATUS_SUCCESS }
     }
 
+    /// `lookup_mount()`: the first map that mounts the key.
+    fn mount(&mut self, ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, name: &[u8]) -> i32 {
+        for info in self.m.iter_mut() {
+            let (_, md) = info.module.as_mut().expect("multi map module");
+            if md.mount(ap, map, name) == 0 {
+                return NSS_STATUS_SUCCESS;
+            }
+        }
+        NSS_STATUS_NOTFOUND
+    }
+
     /// `lookup_done()`.
     fn done(self: Box<Self>) -> i32 {
         let mut rv = 0;

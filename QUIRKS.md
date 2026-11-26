@@ -80,6 +80,7 @@ The last section lists where the port can't or doesn't follow C, and why.
 |---|---|---|---|
 | low | A map with a format (`multi file,sun:/m1 -- ...`) is opened as the module `file,sun`, which doesn't exist, so the whole multi map fails. A type word of 20 bytes or more (any map name starting `file`, `yp`, `nis`, `ldap` or `sss`) trips `_FORTIFY_SOURCE`. | `lookup_multi::nss_open_lookup` | `dump_master_lines` |
 | low | The map read checks each map's NSS status against `LKP_FAIL` (1): `NOTFOUND` and `TRYAGAIN` count as failures, `UNAVAIL` as a success. All the maps read into the multi map's one cache under the multi map's source, so a key in two of them shows once (the first). `--dumpmaps` numbers every map `map[1]`. | `LookupMulti::read_map`, `master::print_map_info` | `dump_master_lines` |
+| low | `lookup_userhome.so` can't be selected: the master map's `userdir` type asks for `lookup_userdir.so`, which doesn't exist, and no nsswitch source or `multi` prefix names `userhome`. | `modules/lookup_userhome.rs` | - |
 | low | Closing the maps stops at the first one whose close fails (`rv = rv \|\| close_lookup()`); the rest stay open. | `LookupMulti::done` | - |
 
 ## Startup (daemon/automount.c, lib/mounts.c)

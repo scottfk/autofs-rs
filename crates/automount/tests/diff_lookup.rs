@@ -243,3 +243,17 @@ fn lookup_program_hydra() {
         .conf("[ autofs ]\ntimeout = 300\nbrowse_mode = no\nmount_nfs_default_protocol = 4\n");
     check_drv(c);
 }
+
+#[test]
+fn lookup_multi() {
+    check_drv(
+        lk(
+            "lk_multi",
+            "/mnt/m multi /etc/autofs/auto.a -ro -- /etc/autofs/auto.b -- auto.prog\n",
+            &[("/mnt/m", "a"), ("/mnt/m", "b"), ("/mnt/m", "both"), ("/mnt/m", "fromprog"), ("/mnt/m", "none")],
+        )
+        .map("auto.a", "a s:/a\nboth s:/both-a\n")
+        .map("auto.b", "b -fstype=ext2 :/dev/b\nboth s:/both-b\n")
+        .etc_mode("autofs/auto.prog", b"#!/bin/sh\n[ \"$1\" = fromprog ] && echo s:/prog\n", 0o755),
+    );
+}

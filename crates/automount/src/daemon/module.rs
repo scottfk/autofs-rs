@@ -178,6 +178,7 @@ pub fn open_lookup(
         "program" => modules::lookup_program::lookup_init(mapfmt, argv).map(|m| Box::new(m) as Box<dyn LookupMod>),
         "yp" => modules::lookup_yp::lookup_init(mapfmt, argv).map(|_| unreachable!()),
         "hosts" => modules::lookup_hosts::lookup_init(mapfmt, argv).map(|m| Box::new(m) as Box<dyn LookupMod>),
+        "userhome" => modules::lookup_userhome::lookup_init(mapfmt, argv).map(|m| Box::new(m) as Box<dyn LookupMod>),
         "multi" => modules::lookup_multi::lookup_init(mapfmt, argv).map(|m| Box::new(m) as Box<dyn LookupMod>),
         other => panic!("lookup module {other} isn't ported yet (phase 2)"),
     };

@@ -5,6 +5,7 @@ pub mod lookup_file;
 pub mod lookup_hosts;
 pub mod lookup_multi;
 pub mod lookup_program;
+pub mod lookup_userhome;
 pub mod lookup_yp;
 pub mod mount_bind;
 pub mod mount_nfs;
