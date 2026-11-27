@@ -196,3 +196,190 @@ pub fn removestdenv(sv: &mut crate::libautofs::macros::Table, prefix: Option<&[u
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// External mounts and the amd mount list (`ext_mounts_hash`, `mnts_hash`).
+
+pub const MNTS_INDIRECT: u32 = 0x0008;
+pub const MNTS_AMD_MOUNT: u32 = 0x0040;
+pub const MNTS_MOUNTED: u32 = 0x0080;
+
+/// A `struct ext_mount`: a mount amd made outside the autofs file system.
+#[derive(Debug)]
+struct ExtMount {
+    mp: Vec<u8>,
+    umount: Option<Vec<u8>>,
+    refs: u32,
+}
+
+static EXT_MOUNTS: std::sync::Mutex<Vec<ExtMount>> = std::sync::Mutex::new(Vec::new());
+
+/// `ext_mount_add()`: count a use of the external mount at `path`.
+pub fn ext_mount_add(path: &[u8], umount: Option<&[u8]>) -> bool {
+    let mut g = EXT_MOUNTS.lock().unwrap();
+    if let Some(em) = g.iter_mut().find(|e| cstr::eq(&e.mp, path)) {
+        em.refs += 1;
+        return true;
+    }
+    g.push(ExtMount { mp: cstr::c(path).to_vec(), umount: umount.map(|u| cstr::c(u).to_vec()), refs: 1 });
+    true
+}
+
+/// `ext_mount_remove()`: true when the last use went.
+pub fn ext_mount_remove(path: &[u8]) -> bool {
+    let mut g = EXT_MOUNTS.lock().unwrap();
+    let Some(i) = g.iter().position(|e| cstr::eq(&e.mp, path)) else { return false };
+    g[i].refs -= 1;
+    if g[i].refs != 0 {
+        return false;
+    }
+    g.remove(i);
+    true
+}
+
+/// `ext_mount_inuse()`: the external mount's use count.
+pub fn ext_mount_inuse(path: &[u8]) -> u32 {
+    EXT_MOUNTS.lock().unwrap().iter().find(|e| cstr::eq(&e.mp, path)).map_or(0, |e| e.refs)
+}
+
+/// A `struct mnt_list`, as far as amd mounts use it.
+#[derive(Debug, Clone, Default)]
+pub struct MntList {
+    pub mp: Vec<u8>,
+    pub refs: u32,
+    pub flags: u32,
+    pub ext_mp: Option<Vec<u8>>,
+    pub amd_pref: Option<Vec<u8>>,
+    pub amd_type: Option<Vec<u8>>,
+    pub amd_opts: Option<Vec<u8>>,
+    pub amd_cache_opts: u32,
+    /// Whether it's on its autofs point's `amdmounts` list.
+    pub on_amdmounts: bool,
+}
+
+static MNTS: std::sync::Mutex<Vec<MntList>> = std::sync::Mutex::new(Vec::new());
+
+/// `mnts_get_mount()`: a reference to the entry for `mp`, made if needed.
+fn mnts_get_mount(g: &mut Vec<MntList>, mp: &[u8]) -> usize {
+    if let Some(i) = g.iter().position(|m| cstr::eq(&m.mp, mp) && m.refs != 0) {
+        g[i].refs += 1;
+        return i;
+    }
+    g.push(MntList { mp: cstr::c(mp).to_vec(), refs: 1, ..MntList::default() });
+    g.len() - 1
+}
+
+fn mnts_put_mount(g: &mut Vec<MntList>, i: usize) {
+    g[i].refs -= 1;
+    if g[i].refs == 0 {
+        g.remove(i);
+    }
+}
+
+/// `mnts_add_amdmount()`: the entry's mount point, flagged as an amd mount.
+pub fn mnts_add_amdmount(entry: &crate::modules::amd_parse::AmdEntry) -> Option<Vec<u8>> {
+    let path = entry.path.as_deref()?;
+    let mut g = MNTS.lock().unwrap();
+    let i = mnts_get_mount(&mut g, path);
+    let m = &mut g[i];
+    m.ext_mp = entry.fs.clone();
+    m.amd_pref = entry.pref.clone();
+    m.amd_type = entry.ty.clone();
+    m.amd_opts = entry.opts.clone();
+    m.amd_cache_opts = entry.cache_opts;
+    m.flags |= MNTS_AMD_MOUNT;
+    m.on_amdmounts = true;
+    Some(m.mp.clone())
+}
+
+/// `mnts_remove_amdmount()`.
+pub fn mnts_remove_amdmount(mp: &[u8]) {
+    let mut g = MNTS.lock().unwrap();
+    let Some(i) = g.iter().position(|m| cstr::eq(&m.mp, mp) && m.refs != 0) else { return };
+    if g[i].flags & MNTS_AMD_MOUNT == 0 {
+        return;
+    }
+    let m = &mut g[i];
+    m.flags &= !MNTS_AMD_MOUNT;
+    m.on_amdmounts = false;
+    m.ext_mp = None;
+    m.amd_type = None;
+    m.amd_pref = None;
+    m.amd_opts = None;
+    m.amd_cache_opts = 0;
+    mnts_put_mount(&mut g, i);
+}
+
+/// `mnts_find_amdmount()`.
+pub fn mnts_find_amdmount(path: &[u8]) -> Option<MntList> {
+    let g = MNTS.lock().unwrap();
+    g.iter().find(|m| cstr::eq(&m.mp, path) && m.refs != 0 && m.flags & MNTS_AMD_MOUNT != 0).cloned()
+}
+
+/// `mnts_add_mount()`.
+pub fn mnts_add_mount(ap_path: &[u8], name: &[u8], flags: u32) {
+    let mp = if name.first() == Some(&b'/') { cstr::c(name).to_vec() } else { [ap_path, b"/", cstr::c(name)].concat() };
+    let mut g = MNTS.lock().unwrap();
+    let i = mnts_get_mount(&mut g, &mp);
+    g[i].flags |= flags;
+}
+
+/// `mnts_remove_mount()`.
+pub fn mnts_remove_mount(mp: &[u8], flags: u32) {
+    let mut g = MNTS.lock().unwrap();
+    if let Some(i) = g.iter().position(|m| cstr::eq(&m.mp, mp) && m.refs != 0)
+        && g[i].flags & flags != 0
+    {
+        g[i].flags &= !flags;
+        mnts_put_mount(&mut g, i);
+    }
+}
+
+/// `umount_ent()` (the daemon isn't shutting down here): unmount `path`; what
+/// `is_mounted()` says afterwards.
+pub fn umount_ent(logopt: u32, path: &[u8]) -> i32 {
+    let _rv = crate::daemon::spawn::spawn_umount(logopt, &[path]);
+    let mounted = is_mounted(path, MNTS_REAL);
+    if !mounted {
+        mnts_remove_mount(path, MNTS_MOUNTED);
+    }
+    mounted as i32
+}
+
+/// `umount_amd_ext_mount()`: drop a use of an external mount, unmounting it
+/// (with its `umount` command if it has one) with the last.
+pub fn umount_amd_ext_mount(ap: &std::sync::Arc<crate::daemon::master::AutofsPoint>, path: &[u8]) -> i32 {
+    let logopt = ap.logopt();
+    let (mp, umount) = {
+        let g = EXT_MOUNTS.lock().unwrap();
+        match g.iter().find(|e| cstr::eq(&e.mp, path)) {
+            None => return 1,
+            Some(e) => (e.mp.clone(), e.umount.clone()),
+        }
+    };
+    if let Some(umount) = umount {
+        let Some((prog, argv)) = crate::libautofs::parse_subs::construct_argv(&umount) else { return 1 };
+        if !ext_mount_remove(&mp) {
+            return 0;
+        }
+        let rv = crate::daemon::spawn::spawnv(logopt, &prog, &argv);
+        if rv == -1 || (libc::WIFEXITED(rv) && libc::WEXITSTATUS(rv) != 0) {
+            error!(logopt, "umount_amd_ext_mount", "failed to umount program mount at {}", mp);
+            return rv;
+        }
+        debug!(logopt, "umount_amd_ext_mount", "umounted program mount at {}", mp);
+        let dev = ap.lock().dev;
+        crate::daemon::automount::rmdir_path(ap, &mp, dev);
+        return 0;
+    }
+    let mut rv = 1;
+    if ext_mount_remove(&mp) {
+        rv = umount_ent(logopt, &mp);
+        if rv != 0 {
+            error!(logopt, "umount_amd_ext_mount", "failed to umount external mount {}", mp);
+        } else {
+            debug!(logopt, "umount_amd_ext_mount", "umounted external mount {}", mp);
+        }
+    }
+    rv
+}

@@ -119,6 +119,8 @@ pub struct AutofsPointData {
     pub logopt: u32,
     pub submount: bool,
     pub mode: u64,
+    /// The autofs file system's device (0 until it's mounted).
+    pub dev: u64,
 }
 
 /// A `struct autofs_point`.
@@ -323,6 +325,7 @@ pub fn master_add_autofs_point(entry: &Arc<MasterMapent>, logopt: u32, nobind: b
             logopt,
             submount,
             mode: 0,
+            dev: 0,
         }),
         entry: Arc::downgrade(entry),
         parent: None,

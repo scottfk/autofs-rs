@@ -219,3 +219,9 @@ pub fn spawn_umount(logopt: u32, args: &[&[u8]]) -> i32 {
     }
     ret
 }
+
+/// `spawnv(logopt, prog, argv)`: run `prog` with `argv` (`argv[0]` included),
+/// waiting for it however long it takes.
+pub fn spawnv(logopt: u32, prog: &[u8], argv: &[Vec<u8>]) -> i32 {
+    do_spawn(logopt, u32::MAX, SPAWN_OPT_NONE, prog, argv)
+}
