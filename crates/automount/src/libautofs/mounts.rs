@@ -793,22 +793,54 @@ fn do_remount_indirect(ap: &std::sync::Arc<crate::daemon::master::AutofsPoint>, 
     status
 }
 
-/// `remount_active_mount()` for an indirect mount.
+/// `do_remount_direct()`.
+fn do_remount_direct(ap: &std::sync::Arc<crate::daemon::master::AutofsPoint>, ty: u32, fd: i32, path: &[u8]) -> i32 {
+    use crate::libautofs::dev_ioctl as ops;
+    let logopt = ap.logopt();
+    if let Some(Ok((uid, gid))) = ops::requester(fd, path)
+        && uid != u32::MAX
+        && gid != u32::MAX
+    {
+        set_tsd_user_vars(logopt, uid, gid);
+    }
+    if crate::daemon::lookup::lookup_nss_mount(ap, None, path) {
+        let mut flags = MNTS_DIRECT | MNTS_MOUNTED;
+        if ty == crate::libautofs::dev_ioctl::AUTOFS_TYPE_OFFSET {
+            flags |= MNTS_OFFSET;
+        }
+        mnts_set_mounted_mount(ap, path, flags);
+        info!(logopt, "re-connected to {}", path);
+        let rf = ap.lock().exp_runfreq;
+        crate::libautofs::alarm::conditional_alarm_add(ap, rf);
+        REMOUNT_SUCCESS
+    } else {
+        info!(logopt, "failed to re-connect {}", path);
+        REMOUNT_FAIL
+    }
+}
+
+/// `remount_active_mount()`.
 fn remount_active_mount(
     ap: &std::sync::Arc<crate::daemon::master::AutofsPoint>,
+    me: Option<(&Mc, u64)>,
     path: &[u8],
     devid: u64,
+    ty: u32,
     ioctlfd: &mut i32,
 ) -> i32 {
     use crate::libautofs::dev_ioctl as ops;
+    use crate::libautofs::dev_ioctl::AUTOFS_TYPE_INDIRECT;
     let logopt = ap.logopt();
-    let str_type = "indirect";
+    let str_type = mount_type_str(ty).unwrap_or("");
     *ioctlfd = -1;
     let fd = open_ioctlfd(logopt, path, devid);
     if fd == -1 {
         return REMOUNT_OPEN_FAIL;
     }
-    let timeout = crate::daemon::master::get_exp_timeout(ap, None);
+    let source = me
+        .and_then(|(mc, id)| me_get(mc, id, |e| e.source))
+        .and_then(|sid| crate::daemon::master::find_source(ap, sid));
+    let timeout = crate::daemon::master::get_exp_timeout(ap, source.as_deref());
     if ap.lock().state == crate::daemon::state::ST_READMAP {
         debug!(logopt, "remount_active_mount", "already mounted, update timeout");
         ops::timeout(fd, timeout);
@@ -835,7 +867,24 @@ fn remount_active_mount(
     let Some(st) = sys::fstat(fd) else {
         return fail(bfmt!("remount_active_mount: failed to stat {} mount {}", str_type, path), REMOUNT_STAT_FAIL);
     };
-    ap.lock().dev = st.st_dev;
+    if ty == AUTOFS_TYPE_INDIRECT {
+        ap.lock().dev = st.st_dev;
+    } else {
+        let (mc, id) = me.expect("direct mount entry");
+        let key = me_get(mc, id, |e| e.key.clone()).unwrap_or_default();
+        if !cstr::eq(path, &key) {
+            return fail(
+                bfmt!("remount_active_mount: mount point path mismatch, path {} mapent {}", path, key),
+                REMOUNT_STAT_FAIL,
+            );
+        }
+        let mut c = mc.lock();
+        if let Some(p) = c.by_id(id) {
+            c.get_mut(p).dev = st.st_dev;
+            c.get_mut(p).ino = st.st_ino;
+            c.set_ino_index(p);
+        }
+    }
     let rf = ap.lock().exp_runfreq;
     notify_mount_result(logopt, rf, path, timeout, str_type);
     *ioctlfd = fd;
@@ -849,57 +898,131 @@ fn remount_active_mount(
         }
         None => 0,
     };
-    if mounted != 0 {
+    if mounted == 0 {
+        // Only an indirect mount keeps its descriptor without a mount.
+        if ty != AUTOFS_TYPE_INDIRECT {
+            ops::close(fd);
+            *ioctlfd = -1;
+        }
+    } else if ty == AUTOFS_TYPE_INDIRECT {
         do_remount_indirect(ap, fd, path);
+    } else {
+        do_remount_direct(ap, ty, fd, path);
     }
     debug!(logopt, "remount_active_mount", "re-connected to mount {}", path);
     REMOUNT_SUCCESS
 }
 
-/// `try_remount()` for the indirect mount itself: 1 when it's reconnected,
-/// 0 when it's mounted but can't be, -1 when there's no mount.
-pub fn try_remount_indirect(ap: &std::sync::Arc<crate::daemon::master::AutofsPoint>) -> i32 {
+/// `try_remount()`: 1 when the mount is reconnected (or a map reread found
+/// it), 0 when it's mounted but can't be, -1 (with `errno`) when there's no
+/// mount.
+pub fn try_remount(ap: &std::sync::Arc<crate::daemon::master::AutofsPoint>, me: Option<(&Mc, u64)>, ty: u32) -> i32 {
     use crate::daemon::master::{MOUNT_FLAG_DIR_CREATED, MOUNT_FLAG_GHOST};
-    let path = ap.path();
-    let (ret, devid) =
-        crate::libautofs::dev_ioctl::mount_device(&path, crate::libautofs::dev_ioctl::AUTOFS_TYPE_INDIRECT);
+    use crate::libautofs::dev_ioctl::{AUTOFS_TYPE_INDIRECT, AUTOFS_TYPE_OFFSET};
+    let logopt = ap.logopt();
+    let path = if ty == AUTOFS_TYPE_INDIRECT {
+        ap.path()
+    } else {
+        let (mc, id) = me.expect("direct mount entry");
+        me_get(mc, id, |e| e.key.clone()).unwrap_or_default()
+    };
+    let (ret, devid) = crate::libautofs::dev_ioctl::mount_device(&path, ty);
     if ret == -1 || ret == 0 {
         return -1;
     }
     let mut fd = -1;
-    let ret = remount_active_mount(ap, &path, devid, &mut fd);
-    // A nobrowse mount point directory is removed at umount anyway.
-    {
+    let ret = remount_active_mount(ap, me, &path, devid, ty, &mut fd);
+    if ty == AUTOFS_TYPE_INDIRECT {
+        // A nobrowse mount point directory is removed at umount anyway.
         let mut a = ap.lock();
         if a.flags & MOUNT_FLAG_GHOST != 0 {
             a.flags &= !MOUNT_FLAG_DIR_CREATED;
         } else {
             a.flags |= MOUNT_FLAG_DIR_CREATED;
         }
+    } else {
+        let (mc, id) = me.unwrap();
+        me_set(mc, id, |e| e.flags &= !MOUNT_FLAG_DIR_CREATED);
+        // The multi-mount's parent for an offset (MM_PARENT), else the entry.
+        let pid = me_get(mc, id, |e| if e.is_mm() { e.mm_parent.unwrap_or(e.id) } else { e.id }).unwrap_or(id);
+        let pkey = me_get(mc, pid, |e| e.key.clone()).unwrap_or_default();
+        let mounted = if pkey.first() == Some(&b'/') {
+            is_mounted(&pkey, MNTS_REAL)
+        } else {
+            match mount_fullpath(4096, &ap.path(), &pkey) {
+                Some(mp) => is_mounted(&mp, MNTS_REAL),
+                None => {
+                    error!(logopt, "try_remount", "mountpoint path too long");
+                    return 0;
+                }
+            }
+        };
+        if !mounted {
+            me_set(mc, id, |e| e.flags |= MOUNT_FLAG_DIR_CREATED);
+        }
     }
     if ret == REMOUNT_READ_MAP {
         return 1;
     }
-    if ret == REMOUNT_SUCCESS && fd != -1 {
-        ap.lock().ioctlfd = fd;
-        return 1;
+    if ret == REMOUNT_SUCCESS {
+        if fd != -1 {
+            if ty == AUTOFS_TYPE_INDIRECT {
+                ap.lock().ioctlfd = fd;
+            } else {
+                let (mc, id) = me.unwrap();
+                let key = me_get(mc, id, |e| e.key.clone()).unwrap_or_default();
+                if ty == AUTOFS_TYPE_OFFSET && !is_mounted(&key, MNTS_REAL) {
+                    crate::libautofs::dev_ioctl::close(fd);
+                    fd = -1;
+                }
+                me_set(mc, id, |e| e.ioctlfd = fd);
+            }
+            return 1;
+        }
+        if ty != AUTOFS_TYPE_INDIRECT {
+            return 1;
+        }
     }
     0
 }
 
-/// `set_mount_catatonic()` for the autofs point itself.
-fn set_mount_catatonic(ap: &crate::daemon::master::AutofsPoint) -> i32 {
+/// `try_remount()` for the indirect mount itself.
+pub fn try_remount_indirect(ap: &std::sync::Arc<crate::daemon::master::AutofsPoint>) -> i32 {
+    try_remount(ap, None, crate::libautofs::dev_ioctl::AUTOFS_TYPE_INDIRECT)
+}
+
+/// `set_mount_catatonic()`: the point's own mount, or an entry's (`me`).
+pub fn set_mount_catatonic_me(ap: &crate::daemon::master::AutofsPoint, me: Option<(&Mc, u64)>, ioctlfd: i32) -> i32 {
     use crate::libautofs::dev_ioctl as ops;
     let logopt = ap.logopt();
-    let (path, dev) = {
+    let (mut path, mut dev) = {
         let a = ap.lock();
         (a.path.clone(), a.dev)
     };
-    let fd = open_ioctlfd(logopt, &path, dev);
-    if fd == -1 {
-        let e = sys::errno();
-        return if e == libc::ENOENT { 0 } else { e };
+    let mut me_fd = -1;
+    if let Some((mc, id)) = me
+        && let Some((k, d, fd)) = me_get(mc, id, |e| (e.key.clone(), e.dev, e.ioctlfd))
+    {
+        if ap.ty() == crate::daemon::master::LKP_DIRECT || k.first() == Some(&b'/') {
+            path = k;
+            dev = d;
+        }
+        me_fd = fd;
     }
+    let mut opened = false;
+    let fd = if ioctlfd >= 0 {
+        ioctlfd
+    } else if me.is_some() && me_fd >= 0 {
+        me_fd
+    } else {
+        let fd = open_ioctlfd(logopt, &path, dev);
+        if fd == -1 {
+            let e = sys::errno();
+            return if e == libc::ENOENT { 0 } else { e };
+        }
+        opened = true;
+        fd
+    };
     let mut err = ops::catatonic(fd);
     if err == -1 {
         err = sys::errno();
@@ -907,8 +1030,29 @@ fn set_mount_catatonic(ap: &crate::daemon::master::AutofsPoint) -> i32 {
     } else {
         debug!(logopt, "set_mount_catatonic", "set {} catatonic", path);
     }
-    ops::close(fd);
+    if opened {
+        ops::close(fd);
+    }
     err
+}
+
+fn set_mount_catatonic(ap: &crate::daemon::master::AutofsPoint) -> i32 {
+    set_mount_catatonic_me(ap, None, -1)
+}
+
+/// `set_offset_tree_catatonic()`: every node of the multi-mount's tree.
+pub fn set_offset_tree_catatonic(ap: &Ap, mc: &Mc, root: u64) {
+    fn walk(ap: &Ap, mc: &Mc, n: u64) {
+        let Some((l, r, fd)) = me_get(mc, n, |e| (e.left, e.right, e.ioctlfd)) else { return };
+        if let Some(l) = l {
+            walk(ap, mc, l);
+        }
+        set_mount_catatonic_me(ap, Some((mc, n)), fd);
+        if let Some(r) = r {
+            walk(ap, mc, r);
+        }
+    }
+    walk(ap, mc, root);
 }
 
 /// `set_indirect_mount_tree_catatonic()`: so nothing hangs on the mounts once
@@ -919,14 +1063,22 @@ pub fn set_indirect_mount_tree_catatonic(ap: &std::sync::Arc<crate::daemon::mast
     }
     for map in ap.entry().maps() {
         let mc = map.mc();
-        let c = mc.lock();
-        let mut p = c.enumerate(None);
-        while let Some(q) = p {
-            let e = c.get(q);
-            if e.mapent.is_some() && e.key != b"*" && e.mm && !e.mm_nonroot {
-                panic!("multi-mount offsets aren't ported yet (phase 4)");
+        let roots: Vec<u64> = {
+            let c = mc.lock();
+            let mut out = Vec::new();
+            let mut p = c.enumerate(None);
+            while let Some(q) = p {
+                let e = c.get(q);
+                // Skip negative and wildcard entries; only offsets need it.
+                if e.mapent.is_some() && e.key != b"*" && e.is_mm_root() {
+                    out.push(e.id);
+                }
+                p = c.enumerate(Some(q));
             }
-            p = c.enumerate(Some(q));
+            out
+        };
+        for r in roots {
+            set_offset_tree_catatonic(ap, &mc, r);
         }
     }
     // ap->ioctlfd is closed by now.
@@ -951,4 +1103,355 @@ pub fn mount_fullpath(max_len: usize, root: &[u8], name: &[u8]) -> Option<Vec<u8
         return None;
     }
     Some(p)
+}
+
+// ---------------------------------------------------------------------------
+// Multi-mount offset trees (`tree_mapent_*`). The tree is a binary search
+// tree of cache entries linked by id (`left`, `right`); `mm_root` is the
+// multi-mount's owner and `mm_parent` an offset's nesting point. The cache
+// lock is only held for each read or change, as the work functions mount and
+// unmount (and look entries up again) in between.
+
+use crate::libautofs::cache::Cache;
+
+type Mc = std::sync::Arc<Cache>;
+type Ap = std::sync::Arc<crate::daemon::master::AutofsPoint>;
+
+/// An entry's fields the tree code needs, by id.
+fn me_get<T>(mc: &Mc, id: u64, f: impl FnOnce(&crate::libautofs::cache::Mapent) -> T) -> Option<T> {
+    let c = mc.lock();
+    c.by_id(id).map(|p| f(c.get(p)))
+}
+
+fn me_set(mc: &Mc, id: u64, f: impl FnOnce(&mut crate::libautofs::cache::Mapent)) {
+    let mut c = mc.lock();
+    if let Some(p) = c.by_id(id) {
+        f(c.get_mut(p));
+    }
+}
+
+/// `tree_mapent_cmp(n, me)`: a key below another sorts after it.
+fn tree_mapent_cmp(n_key: &[u8], key: &[u8]) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    if cstr::neq(key, n_key, n_key.len()) {
+        if key.len() < n_key.len() {
+            return Less;
+        } else if key.len() > n_key.len() {
+            return Greater;
+        }
+    }
+    cstr::c(key).cmp(cstr::c(n_key))
+}
+
+/// `tree_mapent_root()`: make the entry the root of its own tree.
+pub fn tree_mapent_root(c: &mut crate::libautofs::cache::CacheInner, p: crate::libautofs::cache::Pos) {
+    let e = c.get_mut(p);
+    e.left = None;
+    e.right = None;
+    e.mm_root = Some(e.id);
+}
+
+/// `tree_mapent_add_node()`.
+pub fn tree_mapent_add_node(c: &mut crate::libautofs::cache::CacheInner, root: u64, me: u64) -> bool {
+    let Some(mp) = c.by_id(me) else { return false };
+    let key = c.get(mp).key.clone();
+    let mut cur = root;
+    loop {
+        let Some(np) = c.by_id(cur) else { return false };
+        let ord = tree_mapent_cmp(&c.get(np).key.clone(), &key);
+        use std::cmp::Ordering::*;
+        match ord {
+            Equal => break,
+            Less => match c.get(np).left {
+                Some(l) => cur = l,
+                None => {
+                    c.get_mut(np).left = Some(me);
+                    let e = c.get_mut(mp);
+                    e.left = None;
+                    e.right = None;
+                    break;
+                }
+            },
+            Greater => match c.get(np).right {
+                Some(r) => cur = r,
+                None => {
+                    c.get_mut(np).right = Some(me);
+                    let e = c.get_mut(mp);
+                    e.left = None;
+                    e.right = None;
+                    break;
+                }
+            },
+        }
+    }
+    let parent = c.get_offset_parent(&key).map(|p| c.get(p).id).unwrap_or(root);
+    let Some(mp) = c.by_id(me) else { return false };
+    let e = c.get_mut(mp);
+    e.mm_root = Some(root);
+    e.mm_parent = Some(parent);
+    true
+}
+
+/// `tree_mapent_is_root()`: the multi-mount's owner or its `/` offset.
+fn tree_mapent_is_root(mc: &Mc, id: u64) -> bool {
+    me_get(mc, id, |e| e.key.last() == Some(&b'/') || e.mm_root == Some(e.id)).unwrap_or(false)
+}
+
+/// `tree_mapent_traverse_subtree()`: `work` on the offsets nested directly in
+/// `base`, in order; the last result (-1 when there was none).
+fn traverse_subtree(mc: &Mc, n: u64, base: u64, strict: bool, work: &mut dyn FnMut(u64) -> i32) -> i32 {
+    let mut ret = -1;
+    let (left, right, parent) = match me_get(mc, n, |e| (e.left, e.right, e.mm_parent)) {
+        Some(v) => v,
+        None => return ret,
+    };
+    if let Some(l) = left {
+        ret = traverse_subtree(mc, l, base, strict, work);
+        if ret == 0 && strict {
+            return ret;
+        }
+    }
+    if !tree_mapent_is_root(mc, n) && parent == Some(base) {
+        ret = work(n);
+        if ret == 0 && strict {
+            return ret;
+        }
+    }
+    if let Some(r) = right {
+        ret = traverse_subtree(mc, r, base, strict, work);
+        if ret == 0 && strict {
+            return ret;
+        }
+    }
+    ret
+}
+
+/// `tree_mapent_delete_offset_tree()`.
+fn delete_offset_tree(ap: &Ap, mc: &Mc, root: u64) -> bool {
+    let logopt = ap.logopt();
+    let Some((left, right)) = me_get(mc, root, |e| (e.left, e.right)) else { return false };
+    if let Some(l) = left {
+        if !delete_offset_tree(ap, mc, l) {
+            return false;
+        }
+        me_set(mc, root, |e| e.left = None);
+    }
+    if let Some(r) = right {
+        if !delete_offset_tree(ap, mc, r) {
+            return false;
+        }
+        me_set(mc, root, |e| e.right = None);
+    }
+    let Some((key, mm_root, id)) = me_get(mc, root, |e| (e.key.clone(), e.mm_root, e.id)) else { return false };
+    if mm_root != Some(id) {
+        debug!(logopt, "tree_mapent_delete_offset_tree", "deleting offset key {}", key);
+        // cache_delete() won't delete an active offset.
+        let mut c = mc.lock();
+        if let Some(p) = c.by_id(id) {
+            c.get_mut(p).mm_root = None;
+        }
+        let ret = c.delete(&key);
+        if ret != crate::libautofs::cache::CHE_OK {
+            if let Some(p) = c.by_id(id) {
+                c.get_mut(p).mm_root = mm_root;
+            }
+            drop(c);
+            warn!(logopt, "failed to delete offset {}", key);
+            return false;
+        }
+        true
+    } else {
+        me_set(mc, root, |e| {
+            e.mm_root = None;
+            e.mm_parent = None;
+        });
+        true
+    }
+}
+
+/// `tree_mapent_delete_offsets()`.
+pub fn tree_mapent_delete_offsets(ap: &Ap, mc: &Mc, key: &[u8]) -> bool {
+    let logopt = ap.logopt();
+    let me = {
+        let c = mc.lock();
+        c.lookup_distinct(key).map(|p| (c.get(p).id, c.get(p).mm_root))
+    };
+    let Some((id, root)) = me else {
+        error!(logopt, "tree_mapent_delete_offsets", "failed to find multi-mount root for key {}", key);
+        return false;
+    };
+    if root != Some(id) {
+        error!(logopt, "tree_mapent_delete_offsets", "mapent for key {} is not multi-mount owner", key);
+        return false;
+    }
+    if !delete_offset_tree(ap, mc, id) {
+        error!(logopt, "tree_mapent_delete_offsets", "could not delete map entry offsets for key {}", key);
+        return false;
+    }
+    true
+}
+
+/// `tree_mapent_umount_mount()`.
+fn tree_mapent_umount_mount(ap: &Ap, mp: &[u8]) {
+    if is_mounted(mp, MNTS_ALL) && sys::umount(mp) != 0 {
+        error!(ap.logopt(), "tree_mapent_umount_mount", "error recovering from mount fail");
+        error!(ap.logopt(), "tree_mapent_umount_mount", "cannot umount {}", mp);
+    }
+}
+
+/// `tree_mapent_cleanup_offsets()`: unmount the offsets of a failed mount.
+pub fn tree_mapent_cleanup_offsets(ap: &Ap, mc: &Mc, oe: u64) {
+    traverse_subtree(mc, oe, oe, false, &mut |n| {
+        if let Some(k) = me_get(mc, n, |e| e.key.clone()) {
+            tree_mapent_umount_mount(ap, &k);
+        }
+        1
+    });
+    let Some(key) = me_get(mc, oe, |e| e.key.clone()) else { return };
+    if key.first() == Some(&b'/') {
+        tree_mapent_umount_mount(ap, &key);
+    } else {
+        match mount_fullpath(4096, &ap.path(), &key) {
+            None => error!(ap.logopt(), "tree_mapent_cleanup_offsets", "mount path is too long"),
+            Some(mp) => tree_mapent_umount_mount(ap, &mp),
+        }
+    }
+}
+
+/// `tree_mapent_rmdir_path_offset()`.
+fn rmdir_path_offset(ap: &Ap, mc: &Mc, oe: u64) -> i32 {
+    let Some((key, root)) = me_get(mc, oe, |e| (e.key.clone(), e.mm_root)) else { return -1 };
+    let (root_dev, root_len) = root.and_then(|r| me_get(mc, r, |e| (e.dev, e.key.len()))).unwrap_or((0, 0));
+    if ap.ty() == crate::daemon::master::LKP_DIRECT {
+        return crate::daemon::automount::rmdir_path(ap, &key, root_dev);
+    }
+    let (ap_len, flags, dev) = {
+        let a = ap.lock();
+        (a.path.len(), a.flags, a.dev)
+    };
+    let split = if flags & crate::daemon::master::MOUNT_FLAG_GHOST != 0 { ap_len + root_len + 1 } else { ap_len };
+    let dir = key[..split.min(key.len())].to_vec();
+    let path = key.get(split + 1..).unwrap_or(&[]).to_vec();
+    if sys::chdir(&dir) == -1 {
+        error!(ap.logopt(), "tree_mapent_rmdir_path_offset", "failed to chdir to {}", dir);
+        return -1;
+    }
+    let ret = crate::daemon::automount::rmdir_path(ap, &path, dev);
+    if sys::chdir(b"/") == -1 {
+        error!(ap.logopt(), "tree_mapent_rmdir_path_offset", "failed to chdir to /");
+    }
+    ret
+}
+
+/// `tree_mapent_mount_offset()`.
+fn tree_mapent_mount_offset(ap: &Ap, mc: &Mc, oe: u64) -> i32 {
+    use crate::daemon::direct::{MOUNT_OFFSET_IGNORE, MOUNT_OFFSET_OK};
+    let key = me_get(mc, oe, |e| e.key.clone()).unwrap_or_default();
+    debug!(ap.logopt(), "tree_mapent_mount_offset", "mount offset {}", key);
+    let ret = crate::daemon::direct::mount_autofs_offset(ap, mc, oe);
+    if ret < MOUNT_OFFSET_OK {
+        if ret != MOUNT_OFFSET_IGNORE {
+            warn!(ap.logopt(), "failed to mount offset");
+            return 0;
+        }
+        debug!(ap.logopt(), "tree_mapent_mount_offset", "ignoring \"nohide\" trigger {}", key);
+        me_set(mc, oe, |e| e.mapent = None);
+    }
+    1
+}
+
+/// `tree_mapent_umount_offset()`.
+fn tree_mapent_umount_offset(ap: &Ap, mc: &Mc, oe: u64) -> i32 {
+    let logopt = ap.logopt();
+    // Subtree offsets left by a nonstrict mount fail.
+    let ret = tree_mapent_umount_offsets(ap, mc, oe);
+    if ret == 0 {
+        return 0;
+    }
+    let Some((key, ioctlfd)) = me_get(mc, oe, |e| (e.key.clone(), e.ioctlfd)) else { return ret };
+    // An offset removed from the multi-mount with an active mount: invalidate
+    // it rather than mount it again.
+    if (ioctlfd != -1 || is_mounted(&key, MNTS_REAL)) && umount_ent_state(logopt, &key, ap.lock().state) != 0 {
+        debug!(logopt, "tree_mapent_umount_offset", "offset {} has active mount, invalidate", key);
+        me_set(mc, oe, |e| e.mapent = None);
+        return 0;
+    }
+    if !is_mounted(&key, MNTS_AUTOFS) {
+        return ret;
+    }
+    debug!(logopt, "tree_mapent_umount_offset", "umount offset {}", key);
+    if crate::daemon::direct::umount_autofs_offset(ap, mc, oe) != 0 {
+        warn!(logopt, "failed to umount offset");
+        return 0;
+    }
+    let created = me_get(mc, oe, |e| e.flags & crate::daemon::master::MOUNT_FLAG_DIR_CREATED != 0).unwrap_or(false);
+    if !created {
+        return ret;
+    }
+    // A partial directory removal is fine; remount only if the mount point
+    // is still there.
+    if rmdir_path_offset(ap, mc, oe) == -1 && sys::stat(&key).is_some() {
+        tree_mapent_mount_offset(ap, mc, oe);
+        me_set(mc, oe, |e| e.flags |= crate::daemon::master::MOUNT_FLAG_DIR_CREATED);
+    }
+    ret
+}
+
+/// `tree_mapent_mount_offsets()`: the offsets nested directly in `oe`.
+pub fn tree_mapent_mount_offsets(ap: &Ap, mc: &Mc, oe: u64, nonstrict: bool) -> i32 {
+    let strict = !nonstrict;
+    traverse_subtree(mc, oe, oe, strict, &mut |n| {
+        let Some((has_mapent, age, root)) = me_get(mc, n, |e| (e.mapent.is_some(), e.age, e.mm_root)) else {
+            return 1;
+        };
+        if !has_mapent {
+            return 1;
+        }
+        let root_age = root.and_then(|r| me_get(mc, r, |e| e.age)).unwrap_or(age);
+        // A stale offset, no longer in the map entry.
+        if age != root_age {
+            tree_mapent_umount_offset(ap, mc, n);
+            return 1;
+        }
+        let ret = tree_mapent_mount_offset(ap, mc, n);
+        // Reconstructing a multi-mount walks into nested mounts.
+        let (st, flags) = {
+            let a = ap.lock();
+            (a.state, a.flags)
+        };
+        if st == crate::daemon::state::ST_READMAP && flags & crate::daemon::master::MOUNT_FLAG_REMOUNT != 0 {
+            let (k, fd) = me_get(mc, n, |e| (e.key.clone(), e.ioctlfd)).unwrap_or_default();
+            if fd != -1 || is_mounted(&k, MNTS_REAL) {
+                tree_mapent_mount_offsets(ap, mc, n, !strict);
+            }
+        }
+        if strict { ret } else { 1 }
+    })
+}
+
+/// `tree_mapent_umount_offsets()`: the offsets nested directly in `oe`, then
+/// for a multi-mount root its own mount.
+pub fn tree_mapent_umount_offsets(ap: &Ap, mc: &Mc, oe: u64) -> i32 {
+    let logopt = ap.logopt();
+    let ret = traverse_subtree(mc, oe, oe, true, &mut |n| tree_mapent_umount_offset(ap, mc, n));
+    if ret != 0 && tree_mapent_is_root(mc, oe) {
+        let key = me_get(mc, oe, |e| e.key.clone()).unwrap_or_default();
+        let Some(mp) = mount_fullpath(4096, &ap.path(), &key) else {
+            error!(logopt, "tree_mapent_umount_offsets", "mount path is too long");
+            return 0;
+        };
+        // A root that can't be unmounted keeps its offsets: put the
+        // triggers back.
+        if is_mounted(&mp, MNTS_REAL) {
+            info!(logopt, "unmounting dir = {}", mp);
+            if umount_ent_state(logopt, &mp, ap.lock().state) != 0 {
+                if tree_mapent_mount_offsets(ap, mc, oe, true) == 0 {
+                    warn!(logopt, "failed to remount offset triggers");
+                }
+                return 0;
+            }
+        }
+        mnts_remove_mount(&mp, MNTS_MOUNTED);
+    }
+    ret
 }

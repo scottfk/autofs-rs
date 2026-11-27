@@ -573,13 +573,13 @@ fn sdbm_hash(s: &[u8], seed: u64) -> u64 {
 }
 
 /// `set_thread_mount_request_log_id()`.
-pub fn set_thread_mount_request_log_id(mt: &indirect::Pending) {
+pub fn set_thread_mount_request_log_id(token: u32, pid: u32, name: &[u8]) {
     if defaults::defaults_get_use_mount_request_log_id() == 0 || log::has_attempt_id() {
         return;
     }
-    let mut id = sdbm_hash(format!("{}", mt.wait_queue_token as i64).as_bytes(), 0);
-    id = sdbm_hash(format!("{}", mt.pid).as_bytes(), id);
-    id = sdbm_hash(&mt.name, id);
+    let mut id = sdbm_hash(format!("{}", token as i64).as_bytes(), 0);
+    id = sdbm_hash(format!("{pid}").as_bytes(), id);
+    id = sdbm_hash(name, id);
     log::set_attempt_id(id);
 }
 
@@ -841,16 +841,49 @@ fn umount_subtree_mounts(ap: &Arc<AutofsPoint>, path: &[u8], is_autofs_fs: bool)
         me = lookup::lookup_source_mapent(ap, &ind_key, false);
     }
     let mut is_mm_root = false;
+    let mut left = 0;
     if let Some((mc, p)) = &me {
-        let c = mc.lock();
-        let e = c.get(*p);
-        is_mm_root = e.mm && !e.mm_nonroot;
-        if e.mm {
-            panic!("multi-mount entries aren't ported yet (phase 4)");
+        let (id, is_mm, key) = {
+            let c = mc.lock();
+            let e = c.get(*p);
+            is_mm_root = e.is_mm_root();
+            (e.id, e.is_mm(), e.key.clone())
+        };
+        if is_mm {
+            if mounts::tree_mapent_umount_offsets(ap, mc, id) == 0 {
+                warn!(logopt, "some offset mounts still present under {}", path);
+                left += 1;
+            }
+            if key.len() > 4096 {
+                crit!(logopt, "umount_subtree_mounts", "me->key too long for buffer");
+                return 1;
+            }
+            let still = {
+                let c = mc.lock();
+                c.lookup_distinct(&key).map(|q| c.get(q).id)
+            };
+            // The entry went while we waited?
+            if still != Some(id) {
+                return 0;
+            }
+            let root_now = {
+                let c = mc.lock();
+                c.by_id(id).is_some_and(|q| c.get(q).is_mm_root())
+            };
+            if left == 0 && root_now && !mounts::tree_mapent_delete_offsets(ap, mc, &key) {
+                warn!(logopt, "couldn't delete offset list");
+                left += 1;
+            }
+            let amd = ap.entry().maps().first().is_some_and(|m| m.lock().flags & master::MAP_FLAG_FORMAT_AMD != 0);
+            if amd {
+                let mut c = mc.lock();
+                if let Some(q) = c.by_id(id) {
+                    c.pop_mapent(q);
+                }
+            }
         }
     }
-    let mut left = 0;
-    if is_autofs_fs {
+    if left != 0 || is_autofs_fs {
         return left;
     }
     if !is_mm_root && mounts::is_mounted(path, mounts::MNTS_REAL) {
@@ -939,7 +972,7 @@ fn umount_autofs(ap: &Arc<AutofsPoint>) -> i32 {
         umount_all(ap);
         indirect::umount_autofs_indirect(ap)
     } else {
-        panic!("direct mounts aren't ported yet (phase 4)");
+        crate::daemon::direct::umount_autofs_direct(ap)
     }
 }
 
@@ -1062,7 +1095,7 @@ fn mount_autofs(ap: &Arc<AutofsPoint>) -> i32 {
         return -1;
     }
     let status = if ap.ty() == master::LKP_DIRECT {
-        panic!("direct mounts aren't ported yet (phase 4)")
+        crate::daemon::direct::mount_autofs_direct(ap)
     } else {
         indirect::mount_autofs_indirect(ap)
     };
@@ -1080,9 +1113,9 @@ fn handle_packet(ap: &Arc<AutofsPoint>) -> i32 {
     debug!(logopt, "handle_packet", "type = {}", pkt.ty);
     match pkt.ty {
         3 => indirect::handle_packet_missing_indirect(ap, &pkt),
-        5 => panic!("direct mounts aren't ported yet (phase 4)"),
+        5 => crate::daemon::direct::handle_packet_missing_direct(ap, &pkt),
         4 => indirect::handle_packet_expire_indirect(ap, &pkt),
-        6 => panic!("direct mounts aren't ported yet (phase 4)"),
+        6 => crate::daemon::direct::handle_packet_expire_direct(ap, &pkt),
         t => {
             error!(logopt, "handle_packet", "unknown packet type {}", t);
             -1
@@ -1564,8 +1597,12 @@ fn handle_mounts_exit(ap: &Arc<AutofsPoint>) -> bool {
     alarm::alarm_delete(ap);
     state::st_remove_tasks(ap);
     state::st_wait_task(ap, state::ST_ANY, 0);
+    // Direct mounts have all gone by now, and are only unmounted at
+    // shutdown: nothing to recover.
     if ap.ty() == master::LKP_DIRECT {
-        panic!("direct mounts aren't ported yet (phase 4)");
+        umount_autofs(ap);
+        handle_mounts_cleanup(ap);
+        return true;
     }
     // A non-zero umount_autofs() left the mount intact (a lookup came in).
     if umount_autofs(ap) == 0 {

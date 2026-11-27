@@ -278,7 +278,50 @@ pub fn expire_proc_indirect(ap: Arc<AutofsPoint>, how: u32, hs: &Handshake) {
                     master::master_notify_submount(&ap, &mnt.mp, st);
                     continue;
                 }
-                panic!("offset mounts aren't ported yet (phase 4)");
+                // An offset without a real mount: check for a manual umount.
+                if mnt.flags & MNTS_OFFSET != 0 && !mounts::is_mounted(&mnt.mp, mounts::MNTS_REAL) {
+                    // Don't touch submounts.
+                    if mounts::mnts_is_submount(&mnt.mp) {
+                        continue;
+                    }
+                    let entry = ap.entry();
+                    entry.source_writelock();
+                    let mut found = None;
+                    for map in entry.maps() {
+                        let mc = map.mc();
+                        let id = {
+                            let c = mc.lock();
+                            c.lookup_distinct(&mnt.mp).map(|p| c.get(p).id)
+                        };
+                        if let Some(id) = id {
+                            found = Some((mc, id));
+                            break;
+                        }
+                    }
+                    if let Some((mc, id)) = found {
+                        let mut c = mc.lock();
+                        if let Some(p) = c.by_id(id) {
+                            let (fd, key) = (c.get(p).ioctlfd, c.get(p).key.clone());
+                            if fd != -1 {
+                                let gone = match sys::fstat(fd) {
+                                    None => true,
+                                    Some(st) => {
+                                        drop(c);
+                                        let n = automount::count_mounts(&ap, &key, st.st_dev);
+                                        c = mc.lock();
+                                        n == 0
+                                    }
+                                };
+                                if gone && let Some(p) = c.by_id(id) {
+                                    dev_ioctl::close(fd);
+                                    c.get_mut(p).ioctlfd = -1;
+                                }
+                            }
+                        }
+                    }
+                    entry.source_unlock();
+                    continue;
+                }
             }
             let st = ap.lock().state;
             if (st == ST_EXPIRE || st == ST_PRUNE) && state::testcancel() {
@@ -413,7 +456,7 @@ fn mount_send_status(mt: &Pending) {
 /// `do_mount_indirect()`.
 fn do_mount_indirect(mut mt: Pending, hs: Arc<Handshake>) {
     let ap = mt.ap.clone();
-    automount::set_thread_mount_request_log_id(&mt);
+    automount::set_thread_mount_request_log_id(mt.wait_queue_token, mt.pid, &mt.name);
     hs.started();
     mt.status = 0;
     let logopt = ap.logopt();

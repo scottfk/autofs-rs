@@ -10,7 +10,8 @@
 //! key and port 2272 on localhost). The binaries go over once per test run.
 //!
 //! Normalized before comparing: thread ids, the kernel's wait queue tokens
-//! (renumbered in order of appearance), requesting pids, and `/tmp/autoXXXXXX`
+//! (renumbered in order of appearance), requesting pids, the daemon's
+//! process group, and `/tmp/autoXXXXXX`
 //! names.
 
 use std::io::Write;
@@ -277,6 +278,8 @@ fn normalize(s: &str, names: &mut Vec<String>) -> String {
     let s = renumber(&s, "request pid ", "P");
     let s = renumber(&s, " pid:", "Q");
     let s = renumber(&s, " tgid:", "Q");
+    // The daemon's process group, in the trigger mount options.
+    let s = renumber(&s, ",pgrp=", "G");
     normalize_tmp(&s, names)
 }
 

@@ -311,7 +311,7 @@ impl LookupProgram {
             let c = mc.lock();
             c.lookup_distinct(name).map(|p| {
                 let e = c.get(p);
-                (e.mapent.clone(), e.age, e.mm)
+                (e.mapent.clone(), e.age, e.mm_nonroot())
             })
         };
         let mut done = false;
@@ -339,11 +339,21 @@ impl LookupProgram {
                     done = true;
                 } else {
                     if mm {
-                        panic!("multi-mount program map entries aren't ported yet (phase 4)");
+                        warn!(
+                            logopt,
+                            "lookup(program): unexpected lookup for active multi-mount key {}, returning fail", name
+                        );
+                        return NSS_STATUS_UNAVAIL;
                     }
-                    let mut c = mc.lock();
-                    if c.lookup_distinct(name).is_some() {
-                        c.delete(name);
+                    let is_mm = {
+                        let c = mc.lock();
+                        c.lookup_distinct(name).map(|p| c.get(p).is_mm())
+                    };
+                    if let Some(is_mm) = is_mm {
+                        if is_mm {
+                            crate::libautofs::mounts::tree_mapent_delete_offsets(ap, &mc, name);
+                        }
+                        mc.lock().delete(name);
                     }
                 }
             }

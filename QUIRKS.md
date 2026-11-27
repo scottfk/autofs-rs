@@ -112,7 +112,7 @@ The last section lists where the port can't or doesn't follow C, and why.
 | low | A program's words are split at every space, and a closing quote ends a word, so two spaces, or a space after a quoted word, make an empty argument. | `parse_subs::construct_argv` | `amd_program_mounts` (`quoted`) |
 | low | `rmdir_path()` unlinks a symbolic link that's the last component and still fails. | `automount::rmdir_path` | - |
 
-## The daemon (daemon/automount.c, daemon/state.c, daemon/indirect.c, daemon/flag.c, lib/mounts.c, modules/mount_bind.c)
+## The daemon (daemon/automount.c, daemon/state.c, daemon/indirect.c, daemon/direct.c, daemon/flag.c, lib/mounts.c, modules/mount_bind.c, modules/parse_sun.c)
 
 | Severity | Quirk | Where | Test |
 |---|---|---|---|
@@ -120,6 +120,9 @@ The last section lists where the port can't or doesn't follow C, and why.
 | low | Bind mount options with an empty member (a trailing comma, `-fstype=bind,ro,`) make the entry a symlink: the empty option compares equal to `symlink` (`_strncmp()` with a length of 0). | `mount_bind::has_symlink_opt` | `daemon_symlinks` (`tc`) |
 | low | `umount_ent()` checks that a mount really went (and logs "the umount binary reported that ... was unmounted") only when `umount` *failed*. | `mounts::umount_ent_state` | - |
 | low | A flag file whose pid is only read on the last of three tries counts as stale (`while (tries--)` leaves 0 either way). | `flag::flag_is_owned` | - |
+| low | A location without `:/` (`:tmpfs`) in a multi-mount entry that has one later (`/a/b :/etc/autofs`) swallows the rest of the entry: `chunklen()` skips blanks while it still expects a colon followed by `/`. | `parse_subs::chunklen` | `daemon_multi_indirect` |
+| low | At a forced shutdown, a direct or offset trigger that `askumount()` reports busy is detached without the "forcing umount" message: the path after the busy check reuses the 0 from `askumount()`. | `direct::do_umount_autofs_direct`, `direct::umount_autofs_offset` | - |
+| low | The duplicate offset message is spelled "duplcate offset detected". | `cache::update_offset` | `daemon_multi_indirect` (`dup`) |
 | low | With several mounts, the order in which they shut down, reload or expire is a race between threads (and between `stderr` writes, which can run two messages together); C's own log order varies from run to run. | `state::st_queue_handler` | `daemon_two_mounts_and_null`, `daemon_hup_reload` (compared unordered) |
 
 ## Startup (daemon/automount.c, lib/mounts.c)

@@ -1435,3 +1435,9 @@ pub fn mount_flags_only(target: &[u8], flags: libc::c_ulong) -> i32 {
     // SAFETY: a valid target; the rest may be null for a propagation change.
     unsafe { libc::mount(std::ptr::null(), t.as_ptr(), std::ptr::null(), flags, std::ptr::null()) }
 }
+
+/// `rand()` (glibc's is `random()`).
+pub fn random() -> i64 {
+    // SAFETY: plain call.
+    unsafe { libc::rand() as i64 }
+}

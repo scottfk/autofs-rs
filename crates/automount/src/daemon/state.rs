@@ -250,7 +250,7 @@ fn expire_proc(ap: &Arc<AutofsPoint>, how: u32) -> i32 {
         if indirect {
             indirect::expire_proc_indirect(ap2, how, &hs2);
         } else {
-            panic!("direct mount expire isn't ported yet (phase 4)");
+            crate::daemon::direct::expire_proc_direct(ap2, how, &hs2);
         }
     });
     let Some(thid) = thid else {
@@ -290,10 +290,151 @@ fn do_readmap(ap: Arc<AutofsPoint>, now: i64, hs: Arc<Handshake>) {
             lookup::lookup_prune_cache(&ap, now);
             lookup::lookup_ghost(&ap);
         } else {
-            panic!("direct map reloads aren't ported yet (phase 4)");
+            readmap_direct(&ap, now);
         }
     }
     do_readmap_cleanup(&ap);
+}
+
+/// `do_readmap_mount()`: after a direct map reread, mount new triggers,
+/// unmount gone ones, and hand a changed entry's mount over.
+fn do_readmap_mount(
+    ap: &Arc<AutofsPoint>,
+    map: &Arc<crate::daemon::master::MapSource>,
+    mc: &Arc<crate::libautofs::cache::Cache>,
+    id: u64,
+    now: i64,
+) -> i32 {
+    use crate::daemon::direct;
+    let logopt = ap.logopt();
+    let nc = master::master_list().lock().nc.clone().expect("null map cache");
+    let Some((key, age, ioctlfd)) = ({
+        let c = mc.lock();
+        c.by_id(id).map(|p| (c.get(p).key.clone(), c.get(p).age, c.get(p).ioctlfd))
+    }) else {
+        return 0;
+    };
+    let ne_age = {
+        let mut c = nc.lock();
+        match c.lookup_distinct(&key) {
+            Some(p) => Some(c.get(p).age),
+            None => {
+                if let Some(p) = c.partial_match(&key) {
+                    let k = c.get(p).key.clone();
+                    c.delete(&k);
+                    drop(c);
+                    error!(logopt, "do_readmap_mount", "removing invalid nested null entry {}", k);
+                }
+                None
+            }
+        }
+    };
+    let master_line = map.lock().master_line as i64;
+    if age < now || ne_age.is_some_and(|a| master_line > a) {
+        // The entry may still be in another map: if so, it takes the mount.
+        let mut valid = lookup::lookup_source_valid_mapent(ap, &key, true);
+        if let Some((vmc, _)) = &valid
+            && Arc::ptr_eq(vmc, mc)
+        {
+            // Removed from this cache: pruned later.
+            valid = None;
+        }
+        if let Some((vmc, _)) = valid {
+            debug!(logopt, "do_readmap_mount", "updating cache entry for valid direct trigger {}", key);
+            let (dev, ino) = {
+                let c = mc.lock();
+                c.by_id(id).map(|p| (c.get(p).dev, c.get(p).ino)).unwrap_or((0, 0))
+            };
+            let vfd = {
+                let mut c = vmc.lock();
+                match c.lookup_distinct(&key) {
+                    None => {
+                        drop(c);
+                        error!(logopt, "do_readmap_mount", "failed to find expected existing valid map entry");
+                        return 0;
+                    }
+                    Some(vp) => {
+                        // Take over the mount.
+                        c.get_mut(vp).ioctlfd = ioctlfd;
+                        ioctlfd
+                    }
+                }
+            };
+            {
+                let mut c = mc.lock();
+                if let Some(p) = c.by_id(id) {
+                    c.get_mut(p).ioctlfd = -1;
+                }
+            }
+            // cache_set_ino_index(vmc, me): the old entry, indexed in the
+            // valid entry's cache.
+            {
+                let mut c = vmc.lock();
+                if let Some(vp) = c.lookup_distinct(&key) {
+                    c.get_mut(vp).dev = dev;
+                    c.get_mut(vp).ino = ino;
+                    c.set_ino_index(vp);
+                }
+            }
+            let timeout = master::get_exp_timeout(ap, Some(map));
+            dev_ioctl::timeout(vfd, timeout);
+            if timeout != 0 {
+                let runfreq = (timeout + CHECK_RATIO - 1) / CHECK_RATIO;
+                let mut a = ap.lock();
+                a.exp_runfreq = if a.exp_runfreq != 0 { a.exp_runfreq.min(runfreq) } else { runfreq };
+            }
+            0
+        } else if !crate::libautofs::mounts::is_mounted(&key, crate::libautofs::mounts::MNTS_REAL) {
+            direct::do_umount_autofs_direct(ap, mc, id)
+        } else {
+            debug!(logopt, "do_readmap_mount", "{} is mounted", key);
+            0
+        }
+    } else {
+        direct::do_mount_autofs_direct(ap, mc, id, master::get_exp_timeout(ap, Some(map)))
+    }
+}
+
+/// The direct map half of `do_readmap()`.
+fn readmap_direct(ap: &Arc<AutofsPoint>, now: i64) {
+    let append_alarm = ap.lock().exp_runfreq == 0;
+    let entry = ap.entry();
+    entry.source_readlock();
+    for map in entry.maps() {
+        // Up to date, or no longer valid?
+        if !map.lock().stale && !master::check_stale_instances(&map) {
+            continue;
+        }
+        let mc = map.mc();
+        'restart: loop {
+            let ids: Vec<u64> = {
+                let c = mc.lock();
+                let mut out = Vec::new();
+                let mut p = c.enumerate(None);
+                while let Some(q) = p {
+                    out.push(c.get(q).id);
+                    p = c.enumerate(Some(q));
+                }
+                out
+            };
+            for id in ids {
+                if do_readmap_mount(ap, &map, &mc, id, now) == -1 {
+                    continue 'restart;
+                }
+            }
+            break;
+        }
+        lookup::lookup_prune_one_cache(ap, &mc, now);
+        master::clear_stale_instances(&map);
+        map.lock().stale = false;
+    }
+    // A direct map that was empty at startup has no expire alarm yet.
+    let rf = ap.lock().exp_runfreq;
+    if append_alarm && rf != 0 {
+        let seconds = rf + sys::random() % rf;
+        alarm::conditional_alarm_add(ap, seconds);
+    }
+    entry.source_unlock();
 }
 
 /// `st_readmap()`.

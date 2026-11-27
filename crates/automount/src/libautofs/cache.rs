@@ -23,6 +23,7 @@ pub const CHE_UPDATED: i32 = 0x0002;
 pub const CHE_MISSING: i32 = 0x0008;
 pub const CHE_COMPLETED: i32 = 0x0010;
 pub const CHE_UNAVAIL: i32 = 0x0040;
+pub const CHE_DUPLICATE: i32 = 0x0020;
 
 const NULL_MAP_HASHSIZE: u32 = 64;
 
@@ -34,15 +35,43 @@ pub struct Mapent {
     pub age: i64,
     pub status: i64,
     pub source: usize,
-    /// `IS_MM(me) && !IS_MM_ROOT(me)`: a multi-mount entry that isn't the root.
-    pub mm_nonroot: bool,
-    pub mm: bool,
+    /// Identity (C's pointer), unique across caches.
+    pub id: u64,
+    /// The multi-mount the entry belongs to (`mm_root`: its root entry's id,
+    /// the entry's own for the root) and its nesting point (`mm_parent`).
+    pub mm_root: Option<u64>,
+    pub mm_parent: Option<u64>,
+    /// The offset tree (`node.left`, `node.right`), as entry ids.
+    pub left: Option<u64>,
+    pub right: Option<u64>,
+    /// Position in the device/inode index (`ino_index`): 0 when not in it,
+    /// higher for the more recently added (C adds at the head).
+    pub ino_seq: u64,
     pub ioctlfd: i32,
     pub dev: u64,
     pub ino: u64,
     pub flags: u32,
     /// The pushed-down map entries (`struct stack`), top first: (mapent, age).
     pub stack: Vec<(Option<Vec<u8>>, i64)>,
+}
+
+static NEXT_ENTRY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+impl Mapent {
+    /// `IS_MM(me)`.
+    pub fn is_mm(&self) -> bool {
+        self.mm_root.is_some()
+    }
+
+    /// `IS_MM_ROOT(me)`.
+    pub fn is_mm_root(&self) -> bool {
+        self.mm_root == Some(self.id)
+    }
+
+    /// `IS_MM(me) && !IS_MM_ROOT(me)`: multi-mount entries that aren't primary.
+    pub fn mm_nonroot(&self) -> bool {
+        self.is_mm() && !self.is_mm_root()
+    }
 }
 
 /// The cache's contents (held under its lock).
@@ -115,7 +144,7 @@ impl CacheInner {
         for b in bucket..self.size as usize {
             let start = if b == bucket { idx } else { 0 };
             for (i, me) in self.hash[b].iter().enumerate().skip(start) {
-                if me.mm_nonroot {
+                if me.mm_nonroot() {
                     continue;
                 }
                 return Some((b, i));
@@ -154,6 +183,89 @@ impl CacheInner {
         }
         let h = hash(b"*", self.size);
         self.hash[h].iter().position(|me| me.key == b"*").map(|i| (h, i))
+    }
+
+    /// The entry with this id.
+    pub fn by_id(&self, id: u64) -> Option<Pos> {
+        for (b, chain) in self.hash.iter().enumerate() {
+            if let Some(i) = chain.iter().position(|m| m.id == id) {
+                return Some((b, i));
+            }
+        }
+        None
+    }
+
+    /// `cache_set_ino_index()`.
+    pub fn set_ino_index(&mut self, p: Pos) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        self.get_mut(p).ino_seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `cache_lookup_ino()`: the most recently indexed entry with this device
+    /// and inode.
+    pub fn lookup_ino(&self, dev: u64, ino: u64) -> Option<Pos> {
+        let mut best: Option<(u64, Pos)> = None;
+        for (b, chain) in self.hash.iter().enumerate() {
+            for (i, me) in chain.iter().enumerate() {
+                if me.ino_seq != 0 && me.dev == dev && me.ino == ino && best.is_none_or(|(s, _)| me.ino_seq > s) {
+                    best = Some((me.ino_seq, (b, i)));
+                }
+            }
+        }
+        best.map(|(_, p)| p)
+    }
+
+    /// `cache_update_offset()`: add or update the offset `key` of the
+    /// multi-mount `mkey` (`CHE_DUPLICATE` for one already seen in this read).
+    pub fn update_offset(&mut self, logopt: u32, mkey: &[u8], key: &[u8], mapent: &[u8], age: i64) -> i32 {
+        let Some(owner) = self.lookup_distinct(mkey) else { return CHE_FAIL };
+        let (owner_id, owner_source) = (self.get(owner).id, self.get(owner).source);
+        if let Some(p) = self.lookup_distinct(key)
+            && self.get(p).age == age
+            && (self.get(p).id == owner_id || cstr::eq(&self.get(p).key, key))
+        {
+            let k = self.get(p).key.clone();
+            warn!(logopt, "duplcate offset detected for key {}", k);
+            self.get_mut(p).mapent = Some(cstr::c(mapent).to_vec());
+            warn!(logopt, "map entry updated with: {}", mapent);
+            return CHE_DUPLICATE;
+        }
+        let ret = self.update(owner_source, key, Some(mapent), age);
+        if ret == CHE_FAIL {
+            warn!(logopt, "failed to add key {} to cache", key);
+            return CHE_FAIL;
+        }
+        ret
+    }
+
+    /// `cache_get_offset_parent()`: the nearest offset above `key`.
+    pub fn get_offset_parent(&self, key: &[u8]) -> Option<Pos> {
+        let key = cstr::c(key);
+        if key.last() == Some(&b'/') {
+            return None;
+        }
+        let mut parent = key.to_vec();
+        let mut tail = parent.len() as isize - 1;
+        loop {
+            if tail < 0 || parent[tail as usize] == 0 {
+                break;
+            }
+            while tail >= 0 && parent[tail as usize] != b'/' {
+                tail -= 1;
+            }
+            if tail < 0 {
+                return None;
+            }
+            parent[tail as usize] = 0;
+            tail -= 1;
+            if tail <= 0 {
+                break;
+            }
+            if let Some(p) = self.lookup_distinct(&parent[..(tail + 1) as usize]) {
+                return Some(p);
+            }
+        }
+        None
     }
 
     /// `cache_clean_null_cache()`: empty the cache.
@@ -198,7 +310,7 @@ impl CacheInner {
     /// `cache_lookup_key_next()`: the next entry in the chain with the same key.
     pub fn lookup_key_next(&self, p: Pos) -> Option<Pos> {
         let me = self.get(p);
-        if me.mm_nonroot {
+        if me.mm_nonroot() {
             // QUIRK: C loops forever here (it tests `me`, not `next`).
             loop {
                 std::thread::park();
@@ -217,8 +329,12 @@ impl CacheInner {
             age,
             status: 0,
             source,
-            mm_nonroot: false,
-            mm: false,
+            id: NEXT_ENTRY.fetch_add(1, Ordering::Relaxed),
+            mm_root: None,
+            mm_parent: None,
+            left: None,
+            right: None,
+            ino_seq: 0,
             ioctlfd: -1,
             dev: u64::MAX,
             ino: u64::MAX,
@@ -343,7 +459,7 @@ impl CacheInner {
         let mut i = 1;
         while i < chain.len() {
             if cstr::eq(key, &chain[i].key) {
-                if chain[i].mm {
+                if chain[i].is_mm() {
                     return CHE_FAIL;
                 }
                 chain.remove(i);
@@ -352,7 +468,7 @@ impl CacheInner {
             i += 1;
         }
         if cstr::eq(key, &chain[0].key) {
-            if chain[0].mm {
+            if chain[0].is_mm() {
                 return CHE_FAIL;
             }
             chain.remove(0);

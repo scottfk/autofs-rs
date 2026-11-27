@@ -227,7 +227,7 @@ fn lookup_program_cwd() {
 }
 
 #[test]
-#[ignore = "hydra's map gives a multi-mount entry (\"/ ronda:/\"): phase 4"]
+#[ignore = "hydra's map gives a multi-mount of NFS mounts (\"/ ronda:/\"): mount_nfs is phase 5"]
 fn lookup_program_hydra() {
     // hydra's auto.netv4 with a fake showmount.
     let netv4 = "#!/bin/bash\nkey=\"$1\"\nopts=\"-fstype=nfs4,hard,nodev,nosuid\"\nSMNT=@T@/showmount\n\

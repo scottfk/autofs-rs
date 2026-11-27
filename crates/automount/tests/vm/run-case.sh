@@ -1,5 +1,6 @@
 #!/bin/sh
 # 20261127 - Created by Claude (claude.ai, Anthropic) - scottfk
+# 20261127 - Time-limit the final tree listing so a dead daemon cannot hang a run - Claude - scottfk
 #
 # run-case.sh - run one daemon case on the root test VM (see tests/common/vm.rs)
 #
@@ -83,5 +84,5 @@ stopd
 wait $PID
 echo "exit $?" > "$C/out/status"
 grep -E " /mnt" /proc/mounts | sed -E "s/(fd|pgrp|pipe_ino)=[0-9]+/\1=N/g" | sort > "$C/out/mounts-after"
-find /mnt /run | sort > "$C/out/tree-after"
+timeout 20 find /mnt /run | sort > "$C/out/tree-after"
 ' run-case "$B" "$C" "$IMPL"

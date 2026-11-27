@@ -654,7 +654,11 @@ impl LookupFile {
                 let lkp_key = {
                     let c = mc.lock();
                     match c.lookup_distinct(&key) {
-                        Some(p) if c.get(p).mm => panic!("multi-mount lookups aren't ported yet (phase 4)"),
+                        Some(p) if c.get(p).is_mm() => {
+                            // MM_ROOT(me)->key.
+                            let r = c.get(p).mm_root.and_then(|id| c.by_id(id)).expect("multi-mount root");
+                            c.get(r).key.clone()
+                        }
                         _ => match &pref {
                             None => key.clone(),
                             Some(pr) => [pr.as_slice(), key.as_slice()].concat(),
