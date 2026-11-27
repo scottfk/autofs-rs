@@ -211,6 +211,8 @@ pub struct Outcome {
     pub cmds: String,
     pub tmp: String,
     pub run: String,
+    /// The tree under `/mnt` (mount points, browse directories).
+    pub mnt: String,
 }
 
 /// One implementation's side of a case.
@@ -429,6 +431,8 @@ mkdir -p "$R/cwd" && cd "$R/cwd" || exit 89
 mount -t proc proc /proc || exit 90
 mount -t tmpfs -o mode=755 tmpfs /run || exit 91
 mount -t tmpfs -o mode=1777 tmpfs /tmp || exit 91
+# Mount points for the cases live under /mnt.
+mount -t tmpfs -o mode=755 tmpfs /mnt || exit 91
 ip link set lo up || exit 92
 # /etc: links to the host's files, then the case's own.
 mkdir -p "$R/hostetc" && mount --bind /etc "$R/hostetc" || exit 93
@@ -460,6 +464,7 @@ done
 echo "exit $?" >"$R/out/status"
 (cd /tmp && find . -mindepth 1 | sort | while read f; do echo "$(stat -c '%A %U %G' "$f") $f"; done) >"$R/out/tmp" 2>&1
 (cd /run && find . -mindepth 1 | sort | while read f; do echo "$(stat -c '%A %U %G' "$f") $f"; done) >"$R/out/run" 2>&1
+(cd /mnt && find . -mindepth 1 | sort | while read f; do echo "$(stat -c '%A %U %G' "$f") $f"; done) >"$R/out/mnt" 2>&1
 chown -R 0:0 "$R/out" 2>/dev/null
 exit 0
 "#,
@@ -553,10 +558,12 @@ pub fn run(case: &Case, imp: &Impl) -> Outcome {
         let src = recorder_file(p);
         std::fs::hard_link(&src, t.join(format!("bin/rec-{p}"))).unwrap();
     }
+    let root_s = fixed_root().to_str().unwrap().to_string();
     for (p, c, mode) in &case.etc {
         let f = t.join("etc").join(p);
         std::fs::create_dir_all(f.parent().unwrap()).unwrap();
-        std::fs::write(&f, c).unwrap();
+        let c = String::from_utf8_lossy(c).replace("@T@", &root_s).into_bytes();
+        std::fs::write(&f, &c).unwrap();
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(*mode)).unwrap();
     }
     for (p, c) in &case.files {
@@ -606,6 +613,7 @@ pub fn run(case: &Case, imp: &Impl) -> Outcome {
         cmds: fix(read(&t, "out/cmds")),
         tmp: fix(read(&t, "out/tmp")),
         run: read(&t, "out/run"),
+        mnt: read(&t, "out/mnt"),
     }
 }
 
@@ -628,6 +636,133 @@ pub fn c_impl() -> Impl {
         env: vec!["LD_LIBRARY_PATH=@T@/clib".to_string()],
         setup,
     }
+}
+
+/// Run `cmd` (a program and its arguments) and insist it works.
+fn run_ok(cmd: &mut Command) {
+    let st = cmd.status().unwrap_or_else(|e| panic!("{cmd:?}: {e}"));
+    assert!(st.success(), "{cmd:?} failed");
+}
+
+/// The C driver (tests/drv/drv.c) linked with the reference daemon's objects,
+/// and the recording mount modules (tests/drv/mount_fake.c), built once into
+/// `target/difftest/.tools/cdrv/`.
+fn c_driver_dir() -> PathBuf {
+    static BUILT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BUILT
+        .get_or_init(|| {
+            let dir = workspace_dir().join("target/difftest/.tools/cdrv");
+            let tmp = workspace_dir().join(format!("target/difftest/.tools/cdrv.{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&tmp);
+            std::fs::create_dir_all(tmp.join("mods")).unwrap();
+            let r = reference_dir();
+            let inc = format!("-I{}", r.join("include").display());
+            run_ok(
+                Command::new("objcopy")
+                    .args(["--redefine-sym", "main=automount_real_main"])
+                    .arg(r.join("daemon/automount.o"))
+                    .arg(tmp.join("automount.o")),
+            );
+            let mut cc = Command::new("cc");
+            cc.args([
+                "-O2",
+                "-D_GNU_SOURCE",
+                "-D_REENTRANT",
+                "-D_FILE_OFFSET_BITS=64",
+                "-fPIE",
+                "-pie",
+                "-rdynamic",
+                &inc,
+                "-I/usr/include/tirpc",
+                "-o",
+            ])
+            .arg(tmp.join("drv"))
+            .arg(manifest_dir().join("tests/drv/drv.c"))
+            .arg(tmp.join("automount.o"));
+            for o in [
+                "indirect",
+                "direct",
+                "spawn",
+                "module",
+                "mount",
+                "master",
+                "master_tok",
+                "master_parse.tab",
+                "lookup",
+                "state",
+                "flag",
+            ] {
+                cc.arg(r.join(format!("daemon/{o}.o")));
+            }
+            cc.arg(format!("-L{}", r.join("lib").display())).args(["-lautofs", "-ltirpc", "-ldl", "-lpthread"]);
+            run_ok(&mut cc);
+            for m in ["nfs", "bind", "generic", "autofs", "ext2", "afs", "changer"] {
+                run_ok(
+                    Command::new("cc")
+                        .args([
+                            "-O2",
+                            "-shared",
+                            "-fPIC",
+                            "-D_GNU_SOURCE",
+                            &inc,
+                            "-I/usr/include/tirpc",
+                            &format!("-DMODNAME=\"{m}\""),
+                            "-o",
+                        ])
+                        .arg(tmp.join(format!("mods/mount_{m}.so")))
+                        .arg(manifest_dir().join("tests/drv/mount_fake.c")),
+                );
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::rename(&tmp, &dir).unwrap();
+            dir
+        })
+        .clone()
+}
+
+/// The C driver's side: the reference modules but the recording mount modules.
+pub fn c_drv_impl() -> Impl {
+    let mut c = c_impl();
+    let d = c_driver_dir();
+    c.bin = d.join("drv");
+    for (name, target) in MODULES {
+        if !name.starts_with("mount_") {
+            continue;
+        }
+        let line = match target {
+            Some(t) => format!("ln -s {t} \"$R/cmod/{name}\""),
+            None => format!("cp {} \"$R/cmod/\"", q(mods_path(&d, name).to_str().unwrap())),
+        };
+        let real = match target {
+            Some(_) => format!("ln -s {} \"$R/cmod/{name}\"", target.unwrap()),
+            None => format!("cp {} \"$R/cmod/\"", q(reference_dir().join("modules").join(name).to_str().unwrap())),
+        };
+        if let Some(i) = c.setup.iter().position(|l| *l == real) {
+            c.setup[i] = line;
+        }
+    }
+    c.label = "c";
+    c
+}
+
+fn mods_path(d: &Path, name: &str) -> PathBuf {
+    d.join("mods").join(name)
+}
+
+/// The Rust driver's side.
+pub fn r_drv_impl() -> Impl {
+    Impl { label: "r", bin: PathBuf::from(env!("CARGO_BIN_EXE_automount-drv")), env: Vec::new(), setup: Vec::new() }
+}
+
+/// Run both drivers and compare; returns the C outcome.
+pub fn check_drv(case: Case) -> Outcome {
+    let c = run(&case, &c_drv_impl());
+    let r = run(&case, &r_drv_impl());
+    if std::env::var_os("AUTOFS_DIFF_SHOW").is_some() {
+        eprintln!("=== {} ===\n{c:#?}", case.name);
+    }
+    compare(&case.name, &c, &r);
+    c
 }
 
 /// The Rust side.
@@ -663,6 +798,7 @@ fn compare(name: &str, c: &Outcome, r: &Outcome) {
         field!(cmds);
         field!(tmp);
         field!(run);
+        field!(mnt);
         panic!("{msg}");
     }
 }

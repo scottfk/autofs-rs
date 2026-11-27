@@ -4,7 +4,8 @@
 //! (`lookup_file.so` and so on, and the compatibility symlinks `lookup_files.so`,
 //! `lookup_nis.so`, `mount_nfs4.so`, `mount_ext3.so`, `mount_ext4.so`) opens it;
 //! any other name fails as `dlopen()` fails for a missing file, with the same
-//! message.
+//! message. `lookup_nisplus.so` is built but can't be loaded on hydra (libnsl 2
+//! has no NIS+ functions), so `nisplus` fails with that `dlopen()` message.
 
 use std::sync::Arc;
 
@@ -21,18 +22,100 @@ pub trait LookupMod: Send + std::fmt::Debug {
     fn reinit(&mut self, mapfmt: Option<&[u8]>, argv: &Argv) -> i32;
     fn read_master(&mut self, master: &Arc<Master>, age: i64) -> i32;
     fn read_map(&mut self, ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, age: i64) -> i32;
+    /// `lookup_mount()`.
+    fn mount(&mut self, _ap: &Arc<AutofsPoint>, _map: &Arc<MapSource>, name: &[u8]) -> i32 {
+        panic!("lookup_mount for {} isn't ported yet", String::from_utf8_lossy(name));
+    }
     fn done(self: Box<Self>) -> i32;
 }
 
 /// A parse module's entry points.
 pub trait ParseMod: Send + std::fmt::Debug {
     fn reinit(&mut self, argv: &Argv) -> i32;
+    /// The sun parser's macro table (`pctxt->subst`), for program maps.
+    fn subst(&self) -> Option<crate::libautofs::macros::Table> {
+        None
+    }
+    /// `parse_mount()`.
+    fn mount(&mut self, _ap: &Arc<AutofsPoint>, _map: &Arc<MapSource>, _name: &[u8], _mapent: Option<&[u8]>) -> i32 {
+        panic!("parse_mount isn't ported yet for this format (phase 2)");
+    }
     fn done(self: Box<Self>) -> i32;
 }
 
 /// A mount module's entry points.
 pub trait MountMod: Send + std::fmt::Debug {
+    /// `mount_mount()`.
+    fn mount(
+        &mut self,
+        _ap: &Arc<AutofsPoint>,
+        _root: &[u8],
+        _name: &[u8],
+        _what: Option<&[u8]>,
+        _fstype: &[u8],
+        _options: Option<&[u8]>,
+    ) -> i32 {
+        panic!("mount_mount isn't ported yet (phases 3-5)");
+    }
     fn done(self: Box<Self>) -> i32;
+}
+
+/// The test driver's switch: open recording mount modules instead of the real
+/// ones (`automount-drv`; the C driver gets the same from fake `.so` files).
+pub static FAKE_MOUNTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A recording mount module: logs what it's asked to do and succeeds.
+#[derive(Debug)]
+pub struct FakeMount {
+    name: Vec<u8>,
+}
+
+fn fake_log(s: &[u8]) {
+    let mut m = s.to_vec();
+    m.push(b'\n');
+    crate::sys::write_stderr(&m);
+}
+
+impl MountMod for FakeMount {
+    fn mount(
+        &mut self,
+        _ap: &Arc<AutofsPoint>,
+        root: &[u8],
+        name: &[u8],
+        what: Option<&[u8]>,
+        fstype: &[u8],
+        options: Option<&[u8]>,
+    ) -> i32 {
+        use crate::daemon::master::cstr_or_null;
+        fake_log(&bfmt!(
+            "fake mount({}): root={} name={} what={} fstype={} options={}",
+            self.name,
+            root,
+            name,
+            cstr_or_null(&what.map(|w| w.to_vec())),
+            fstype,
+            cstr_or_null(&options.map(|o| o.to_vec()))
+        ));
+        0
+    }
+
+    fn done(self: Box<Self>) -> i32 {
+        fake_log(&bfmt!("fake mount({}): done", self.name));
+        0
+    }
+}
+
+/// The mount modules upstream's build has (`mount_*.so`, with the symlinks).
+const MOUNT_MODULES: [&[u8]; 10] =
+    [b"nfs", b"nfs4", b"bind", b"generic", b"autofs", b"ext2", b"ext3", b"ext4", b"afs", b"changer"];
+
+/// The file a mount module name opens (the compatibility names are symlinks).
+fn mount_file_name(name: &[u8]) -> &[u8] {
+    match name {
+        b"nfs4" => b"nfs",
+        b"ext3" | b"ext4" => b"ext2",
+        n => n,
+    }
 }
 
 /// `dlerror()` for a module file that doesn't exist.
@@ -47,7 +130,6 @@ fn lookup_name(name: &[u8]) -> Option<&'static str> {
         b"program" => "program",
         b"dir" => "dir",
         b"yp" | b"nis" => "yp",
-        b"nisplus" => "nisplus",
         b"hosts" => "hosts",
         b"multi" => "multi",
         b"userhome" => "userhome",
@@ -62,6 +144,18 @@ pub fn open_lookup(
     mapfmt: Option<&[u8]>,
     argv: &Argv,
 ) -> Result<Box<dyn LookupMod>, i32> {
+    if cstr::eq(name, b"nisplus") {
+        if let Some(p) = err_prefix {
+            logerr!(
+                "open_lookup",
+                "68",
+                "{}cannot open lookup module nisplus ({}/lookup_nisplus.so: undefined symbol: nis_list)",
+                p,
+                AUTOFS_LIB_DIR
+            );
+        }
+        return Err(NSS_STATUS_UNKNOWN);
+    }
     let which = match lookup_name(name) {
         Some(w) => w,
         None => {
@@ -84,6 +178,8 @@ pub fn open_lookup(
         "program" => modules::lookup_program::lookup_init(mapfmt, argv).map(|m| Box::new(m) as Box<dyn LookupMod>),
         "yp" => modules::lookup_yp::lookup_init(mapfmt, argv).map(|_| unreachable!()),
         "hosts" => modules::lookup_hosts::lookup_init(mapfmt, argv).map(|m| Box::new(m) as Box<dyn LookupMod>),
+        "userhome" => modules::lookup_userhome::lookup_init(mapfmt, argv).map(|m| Box::new(m) as Box<dyn LookupMod>),
+        "multi" => modules::lookup_multi::lookup_init(mapfmt, argv).map(|m| Box::new(m) as Box<dyn LookupMod>),
         other => panic!("lookup module {other} isn't ported yet (phase 2)"),
     };
     m.ok_or(NSS_STATUS_UNKNOWN)
@@ -98,7 +194,7 @@ pub fn close_lookup(m: Box<dyn LookupMod>) -> i32 {
 pub fn open_parse(name: &[u8], err_prefix: Option<&[u8]>, argv: &Argv) -> Option<Box<dyn ParseMod>> {
     match cstr::c(name) {
         b"sun" => modules::parse_sun::parse_init(argv).map(|m| Box::new(m) as Box<dyn ParseMod>),
-        b"amd" => panic!("parse module amd isn't ported yet (phase 2)"),
+        b"amd" => modules::parse_amd::parse_init(argv).map(|m| Box::new(m) as Box<dyn ParseMod>),
         _ => {
             if let Some(p) = err_prefix {
                 logerr!(
@@ -133,6 +229,11 @@ pub fn close_parse(m: Box<dyn ParseMod>) -> i32 {
 
 /// `open_mount()`.
 pub fn open_mount(name: &[u8], err_prefix: Option<&[u8]>) -> Option<Box<dyn MountMod>> {
+    if FAKE_MOUNTS.load(std::sync::atomic::Ordering::Relaxed) && MOUNT_MODULES.contains(&cstr::c(name)) {
+        let n = mount_file_name(cstr::c(name));
+        fake_log(&bfmt!("fake mount({}): init", n));
+        return Some(Box::new(FakeMount { name: n.to_vec() }));
+    }
     match cstr::c(name) {
         b"nfs" | b"nfs4" => modules::mount_nfs::mount_init().map(|m| Box::new(m) as Box<dyn MountMod>),
         b"bind" => modules::mount_bind::mount_init().map(|m| Box::new(m) as Box<dyn MountMod>),

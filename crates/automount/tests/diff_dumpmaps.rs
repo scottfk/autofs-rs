@@ -119,13 +119,22 @@ const MASTER_LINES: &[&str] = &[
     "/o //server/cn=x",
     "/p yp:auto.p",
     "/p nis auto.p",
-    // nisplus comes with its module in phase 2.
-    // Other multi maps come with lookup_multi in phase 2; this one crashes
-    // in the parser (append_argv() through a NULL vector).
+    "/p nisplus:auto.p",
+    "/q multi /etc/autofs/auto.a -- /etc/autofs/auto.b",
+    "/q multi file:/etc/autofs/auto.a -ro -- file,sun:/etc/autofs/auto.b -rw",
+    "/q multi,sun /etc/autofs/auto.a",
+    // This one crashes in the parser (append_argv() through a NULL vector).
     "/q multi -hosts",
+    "/q multi /etc/autofs/auto.a --",
+    "/q multi auto.a -- auto.b -- /etc/autofs/auto.a",
+    "/q multi file:/etc/autofs/auto.missing -- /etc/autofs/auto.b",
+    "/q multi yp:auto.a -- /etc/autofs/auto.b",
+    "/q multi file_this_name_is_long_ok -- /etc/autofs/auto.b",
     "/r file /etc/autofs/auto.a",
     "/r file  :  /etc/autofs/auto.a",
-    // amd maps come with parse_amd in phase 2.
+    "/r file,amd:/etc/autofs/auto.amd",
+    "/r file,amd:auto.amd",
+    "/r program,amd:/etc/autofs/auto.a",
     "/s/ /etc/autofs/auto.a",
     "/ /etc/autofs/auto.a",
     "// /etc/autofs/auto.a",
@@ -141,10 +150,14 @@ fn dump_master_lines() {
             Case::new(&format!("master_line_{i}"), &["-d", "-m"])
                 .etc_bytes("autofs/auto.master", format!("{line}\n").as_bytes())
                 .map("auto.a", "k v\n")
-                .map("auto.b", "l w\n"),
+                .map("auto.b", "l w\n")
+                .map("auto.amd", AMD_MAP),
         );
     }
 }
+
+const AMD_MAP: &str =
+    "/defaults type:=nfs;opts:=rw\nk1 rhost:=s1;rfs:=/x\nsub/dir type:=link;fs:=/tmp\n* type:=nfs;rhost:=${key}\n";
 
 #[test]
 fn dump_master_lines_after_error() {
@@ -155,7 +168,8 @@ fn dump_master_lines_after_error() {
             Case::new(&format!("master_after_{i}"), &["-d", "-m"])
                 .etc_bytes("autofs/auto.master", format!("{line}\n/z /etc/autofs/auto.a -ro\n/y auto.b\n").as_bytes())
                 .map("auto.a", "k v\n")
-                .map("auto.b", "l w\n"),
+                .map("auto.b", "l w\n")
+                .map("auto.amd", AMD_MAP),
         );
     }
 }
@@ -587,4 +601,30 @@ fn dump_nsswitch_error_recovery() {
             .master("/a auto.a\n")
             .map("auto.a", "k v\n"),
     );
+}
+
+#[test]
+fn dump_amd_sections() {
+    check(
+        Case::new("amd_sections", &["-d", "-m"])
+            .conf(
+                "[ amd ]\nbrowsable_dirs = yes\nlog_options = all\nsearch_path = /etc/autofs/amd:/etc/autofs\n\
+                 [ /amd1 ]\nmap_name = auto.amd\nmap_type = file\n[ /amd2 ]\nmap_options = cache:=all\n",
+            )
+            .master("/amd1 auto.amd\n/amd2 /etc/autofs/auto.amd\n/amd3 file,amd:auto.inamd\n")
+            .map("auto.amd", AMD_MAP)
+            .map("amd/auto.inamd", "a type:=nfs\n"),
+    );
+}
+
+#[test]
+fn dump_nisplus() {
+    for (i, dom) in ["", "example.com"].iter().enumerate() {
+        let c = Case::new(&format!("nisplus_{i}"), &["-d", "-m"])
+            .etc("nsswitch.conf", "automount: nisplus files\n")
+            .master("/a nisplus:auto.a\n/b auto.b\n/- nisplus:auto.direct\n")
+            .map("auto.b", "k v\n");
+        let c = if dom.is_empty() { c } else { c.setup(&format!("echo {dom} >/proc/sys/kernel/domainname")) };
+        check(c);
+    }
 }

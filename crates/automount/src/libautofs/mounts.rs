@@ -1,6 +1,8 @@
-//! `lib/mounts.c`: the parts this phase needs: `is_mounted()` over the
-//! kernel's mount table (`local_getmntent_r()`), and the kernel protocol probe
-//! the daemon makes at startup (`query_kproto_ver()`).
+//! `lib/mounts.c`: the parts used so far: `is_mounted()` over the kernel's
+//! mount table (`local_getmntent_r()`), the kernel protocol probe the daemon
+//! makes at startup (`query_kproto_ver()`), the per-request user variables
+//! (`set_tsd_user_vars()`) and the standard macros made from them
+//! (`addstdenv()`), and `mkdir_path()`.
 
 use crate::libautofs::cstr;
 use crate::sys;
@@ -117,4 +119,80 @@ pub fn query_kproto_ver() -> bool {
     let ok = sys::autofs_test_mount(&t_dir);
     sys::rmdir(&t_dir);
     ok
+}
+
+/// A `struct thread_stdenv_vars`: who asked for the mount.
+#[derive(Debug, Clone, Default)]
+pub struct Tsv {
+    pub uid: u32,
+    pub gid: u32,
+    pub user: Option<Vec<u8>>,
+    pub group: Option<Vec<u8>>,
+    pub home: Option<Vec<u8>>,
+}
+
+thread_local! {
+    /// `key_thread_stdenv_vars`.
+    static TSV: std::cell::RefCell<Option<Tsv>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The current thread's user variables.
+pub fn tsv() -> Option<Tsv> {
+    TSV.with(|t| t.borrow().clone())
+}
+
+/// `set_tsd_user_vars()`. Without a passwd entry the thread keeps what it had.
+pub fn set_tsd_user_vars(logopt: u32, uid: u32, gid: u32) {
+    let Some((user, home)) = sys::getpwuid(uid) else {
+        error!(logopt, "set_tsd_user_vars", "failed to get passwd info from getpwuid_r");
+        return;
+    };
+    let group = sys::getgrgid(gid);
+    if group.is_none() {
+        error!(logopt, "set_tsd_user_vars", "failed to get group info from getgrgid_r");
+    }
+    TSV.with(|t| *t.borrow_mut() = Some(Tsv { uid, gid, user: Some(user), group, home: Some(home) }));
+}
+
+const MAX_ENV_NAME: usize = 15;
+
+fn env_name(prefix: Option<&[u8]>, name: &[u8]) -> Option<Vec<u8>> {
+    let mut n = prefix.unwrap_or(b"").to_vec();
+    n.extend_from_slice(name);
+    if n.len() + 1 > MAX_ENV_NAME { None } else { Some(n) }
+}
+
+/// `addstdenv()`: `UID`, `GID`, `USER`, `GROUP`, `HOME` and `SHOST` (with
+/// `prefix`), from the thread's user variables.
+pub fn addstdenv(sv: &mut crate::libautofs::macros::Table, prefix: Option<&[u8]>) {
+    use crate::libautofs::macros::{macro_addvar, macro_findvar};
+    let Some(t) = tsv() else { return };
+    let mut add = |name: &[u8], val: Option<&[u8]>| {
+        if let Some(n) = env_name(prefix, name) {
+            macro_addvar(sv, &n, n.len(), val);
+        }
+    };
+    add(b"UID", Some(t.uid.to_string().as_bytes()));
+    add(b"GID", Some(t.gid.to_string().as_bytes()));
+    add(b"USER", t.user.as_deref());
+    add(b"GROUP", t.group.as_deref());
+    add(b"HOME", t.home.as_deref());
+    if let Some(mv) = macro_findvar(sv, b"HOST", 4) {
+        let mut shost = mv.val.clone();
+        if let Some(d) = cstr::strchr(&shost, b'.') {
+            shost.truncate(d);
+        }
+        if let Some(n) = env_name(prefix, b"SHOST") {
+            macro_addvar(sv, &n, n.len(), Some(&shost));
+        }
+    }
+}
+
+/// `removestdenv()`.
+pub fn removestdenv(sv: &mut crate::libautofs::macros::Table, prefix: Option<&[u8]>) {
+    for name in [&b"UID"[..], b"USER", b"HOME", b"GID", b"GROUP", b"SHOST"] {
+        if let Some(n) = env_name(prefix, name) {
+            crate::libautofs::macros::macro_removevar(sv, &n, n.len());
+        }
+    }
 }

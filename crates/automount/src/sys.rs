@@ -680,3 +680,154 @@ pub fn host_names() -> Vec<Vec<u8>> {
     }
     out
 }
+
+/// `getpwuid_r()`: (name, home), or `None`.
+pub fn getpwuid(uid: u32) -> Option<(Vec<u8>, Vec<u8>)> {
+    let mut buf = vec![0 as c_char; 16384];
+    // SAFETY: zeroed passwd is a valid out buffer.
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut res: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: valid buffers; the strings are copied before buf goes away.
+    unsafe {
+        let r = libc::getpwuid_r(uid, &mut pw, buf.as_mut_ptr(), buf.len(), &mut res);
+        if r != 0 || res.is_null() {
+            return None;
+        }
+        Some((CStr::from_ptr(pw.pw_name).to_bytes().to_vec(), CStr::from_ptr(pw.pw_dir).to_bytes().to_vec()))
+    }
+}
+
+/// `getgrgid_r()`: the group name, or `None`.
+pub fn getgrgid(gid: u32) -> Option<Vec<u8>> {
+    let mut buf = vec![0 as c_char; 65536];
+    // SAFETY: zeroed group is a valid out buffer.
+    let mut gr: libc::group = unsafe { std::mem::zeroed() };
+    let mut res: *mut libc::group = std::ptr::null_mut();
+    // SAFETY: valid buffers; the string is copied before buf goes away.
+    unsafe {
+        let r = libc::getgrgid_r(gid, &mut gr, buf.as_mut_ptr(), buf.len(), &mut res);
+        if r != 0 || res.is_null() {
+            return None;
+        }
+        Some(CStr::from_ptr(gr.gr_name).to_bytes().to_vec())
+    }
+}
+
+/// `mkdir(path, mode)`.
+pub fn mkdir(path: &[u8], mode: u32) -> i32 {
+    let p = cstring(path);
+    // SAFETY: p is a valid C string.
+    unsafe { libc::mkdir(p.as_ptr(), mode) }
+}
+
+/// The environment (`environ`) with `sets` applied as `setenv(name, val, 1)`
+/// calls would apply them, in order: a name already there keeps its place.
+pub fn environ_with(sets: &[(Vec<u8>, Vec<u8>)]) -> Vec<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut env: Vec<Vec<u8>> = Vec::new();
+    for (k, v) in std::env::vars_os() {
+        let mut e = k.as_bytes().to_vec();
+        e.push(b'=');
+        e.extend_from_slice(v.as_bytes());
+        env.push(e);
+    }
+    for (name, val) in sets {
+        let mut e = name.clone();
+        e.push(b'=');
+        e.extend_from_slice(val);
+        match env.iter().position(|x| x.starts_with(name) && x.get(name.len()) == Some(&b'=')) {
+            Some(i) => env[i] = e,
+            None => env.push(e),
+        }
+    }
+    env
+}
+
+/// What `lookup_program`'s child does: stdout and stderr on two pipes,
+/// signals reset, `chdir(dir)` (writing `chdir_msg` to stderr, or to syslog,
+/// if it fails and the message isn't empty), then `execve(prog, [prog, arg],
+/// env)`; `_exit(255)` if that fails. Returns the pid.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_program(
+    prog: &[u8],
+    arg: &[u8],
+    env: &[Vec<u8>],
+    dir: &[u8],
+    chdir_msg: &[u8],
+    msg_to_syslog: bool,
+    out: (Fd, Fd),
+    err: (Fd, Fd),
+) -> i32 {
+    let prog_c = cstring(prog);
+    let argv_c = [cstring(prog), cstring(arg)];
+    let argv_p: [*const c_char; 3] = [argv_c[0].as_ptr(), argv_c[1].as_ptr(), std::ptr::null()];
+    let env_c: Vec<CString> = env.iter().map(|e| cstring(e)).collect();
+    let mut env_p: Vec<*const c_char> = env_c.iter().map(|e| e.as_ptr()).collect();
+    env_p.push(std::ptr::null());
+    let dir_c = cstring(dir);
+    let msg_c = cstring(chdir_msg);
+    // SAFETY: between fork and exec the child makes only async-signal-safe
+    // calls (and syslog() as C does) on memory prepared above.
+    unsafe {
+        let pid = libc::fork();
+        if pid != 0 {
+            return pid;
+        }
+        reset_signals_raw();
+        libc::close(out.0);
+        libc::close(err.0);
+        libc::dup2(out.1, 1);
+        libc::dup2(err.1, 2);
+        libc::close(out.1);
+        libc::close(err.1);
+        if libc::chdir(dir_c.as_ptr()) != 0 && !chdir_msg.is_empty() {
+            if msg_to_syslog {
+                libc::syslog(libc::LOG_INFO, c"%s".as_ptr(), msg_c.as_ptr());
+            } else {
+                libc::write(2, chdir_msg.as_ptr().cast(), chdir_msg.len());
+                libc::write(2, b"\n".as_ptr().cast(), 1);
+            }
+        }
+        libc::execve(prog_c.as_ptr(), argv_p.as_ptr(), env_p.as_ptr());
+        libc::_exit(255);
+    }
+}
+
+/// `poll()` on two descriptors for `POLLIN`: the result and the `revents`.
+/// A descriptor of -1 is ignored, as poll() does.
+pub fn poll2(a: Fd, b: Fd) -> (i32, i16, i16) {
+    let mut p = [
+        libc::pollfd { fd: a, events: libc::POLLIN, revents: 0 },
+        libc::pollfd { fd: b, events: libc::POLLIN, revents: 0 },
+    ];
+    // SAFETY: p is a valid array of two pollfds.
+    let r = unsafe { libc::poll(p.as_mut_ptr(), 2, -1) };
+    (r, p[0].revents, p[1].revents)
+}
+
+/// `getpwnam(name)->pw_dir`.
+pub fn getpwnam_home(name: &[u8]) -> Option<Vec<u8>> {
+    let n = cstring(name);
+    // SAFETY: n is a valid C string; the result is copied at once.
+    unsafe {
+        let pw = libc::getpwnam(n.as_ptr());
+        if pw.is_null() {
+            return None;
+        }
+        Some(CStr::from_ptr((*pw).pw_dir).to_bytes().to_vec())
+    }
+}
+
+/// `chdir(path)`.
+pub fn chdir(path: &[u8]) -> i32 {
+    let p = cstring(path);
+    // SAFETY: p is a valid C string.
+    unsafe { libc::chdir(p.as_ptr()) }
+}
+
+/// `symlink(target, link)`.
+pub fn symlink(target: &[u8], link: &[u8]) -> i32 {
+    let (t, l) = (cstring(target), cstring(link));
+    // SAFETY: valid C strings.
+    unsafe { libc::symlink(t.as_ptr(), l.as_ptr()) }
+}
