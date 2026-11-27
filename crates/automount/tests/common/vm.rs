@@ -91,8 +91,12 @@ fn push() {
         ssh(&format!("rm -rf {VM_DIR}/c && mkdir -p {VM_DIR}/c {VM_DIR}/r {VM_DIR}/cases && tar -C {VM_DIR}/c -xf -"), &c);
         let r = std::fs::read(env!("CARGO_BIN_EXE_automount")).unwrap();
         ssh(&format!("cat > {VM_DIR}/r/automount.new && chmod 755 {VM_DIR}/r/automount.new && mv {VM_DIR}/r/automount.new {VM_DIR}/r/automount"), &r);
-        let script = std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vm/run-case.sh")).unwrap();
-        ssh(&format!("cat > {VM_DIR}/run-case.sh && chmod 755 {VM_DIR}/run-case.sh"), &script);
+        let f = std::fs::read(env!("CARGO_BIN_EXE_fake-nfsd")).unwrap();
+        ssh(&format!("cat > {VM_DIR}/r/fake-nfsd.new && chmod 755 {VM_DIR}/r/fake-nfsd.new && mv {VM_DIR}/r/fake-nfsd.new {VM_DIR}/r/fake-nfsd"), &f);
+        for name in ["run-case.sh", "net-setup.sh"] {
+            let script = std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vm").join(name)).unwrap();
+            ssh(&format!("cat > {VM_DIR}/{name} && chmod 755 {VM_DIR}/{name}"), &script);
+        }
     });
 }
 
@@ -114,6 +118,9 @@ pub struct VmCase {
     /// Compare the log as sorted lines: for cases where C's own order varies
     /// (threads racing, such as several mounts shutting down at once).
     pub unordered_log: bool,
+    /// The fake NFS servers (`fake-nfsd`'s configuration; see net-setup.sh):
+    /// the case then gets a network of its own.
+    pub net: String,
 }
 
 impl VmCase {
@@ -133,7 +140,13 @@ impl VmCase {
             pre: String::new(),
             drop_lines: Vec::new(),
             unordered_log: false,
+            net: String::new(),
         }
+    }
+
+    pub fn net(mut self, conf: &str) -> VmCase {
+        self.net = conf.into();
+        self
     }
 
     pub fn pre(mut self, s: &str) -> VmCase {
@@ -283,7 +296,33 @@ fn normalize(s: &str, names: &mut Vec<String>) -> String {
     // the first mount opens its pipe, in C too).
     let s = renumber(&s, ",pgrp=", "G");
     let s = renumber(&s, " -o fd=", "F");
+    // NFS probe times and the costs made from them.
+    let s = mask_number_after(
+        &s,
+        &["rpc ping time: ", "rpc ping time ", "random selection time: ", "random selection time ", " cost "],
+    );
     normalize_tmp(&s, names)
+}
+
+/// The number (digits and '.') after each of `words`, as `N`.
+fn mask_number_after(s: &str, words: &[&str]) -> String {
+    let mut out = s.to_string();
+    for w in words {
+        let mut res = String::new();
+        let mut rest = out.as_str();
+        while let Some(p) = rest.find(w) {
+            res.push_str(&rest[..p + w.len()]);
+            let tail = &rest[p + w.len()..];
+            let n = tail.chars().take_while(|c| c.is_ascii_digit() || *c == '.').count();
+            if n > 0 {
+                res.push('N');
+            }
+            rest = &tail[n..];
+        }
+        res.push_str(rest);
+        out = res;
+    }
+    out
 }
 
 /// Run the case with one implementation.
@@ -302,6 +341,9 @@ pub fn run_vm(case: &VmCase, imp: &str) -> VmOutcome {
     std::fs::write(dir.join("case/args"), case.args.iter().map(|a| format!("{a}\n")).collect::<String>()).unwrap();
     std::fs::write(dir.join("case/steps"), &case.steps).unwrap();
     std::fs::write(dir.join("case/pre"), &case.pre).unwrap();
+    if !case.net.is_empty() {
+        std::fs::write(dir.join("case/net"), &case.net).unwrap();
+    }
     let input = tar_of(&dir.join("case"), &["."]);
     // Both runs use the same directory, so paths in the outputs match.
     let rdir = format!("{VM_DIR}/cases/{}", case.name);

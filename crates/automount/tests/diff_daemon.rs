@@ -601,3 +601,112 @@ fn daemon_restart_submount() {
          trig /mnt/a/sub/l/; waitlog 'mounted /mnt/a/sub/l'\nsnap\nstopd\n",
     ));
 }
+
+// ---------------------------------------------------------------------------
+// NFS (phase 5). NFS mounts are recorded and made as tmpfs mounts; names come
+// from the case's /etc/hosts.
+
+const HOSTS: &str = "127.0.0.1 localhost\n::1 localhost\n10.99.0.5 ronda\n10.99.0.6 tarn\n";
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_nfs_single_hosts() {
+    // One host each: no probe. Local paths and the local host are bind
+    // mounted; an unknown host fails.
+    check_vm(
+        VmCase::new("d_nfs_single", "/mnt/a /etc/autofs/auto.a\n")
+            .etc("hosts", HOSTS)
+            .map(
+                "auto.a",
+                "r ronda:/export/r\nr4 -fstype=nfs4,hard,nodev ronda:/\nlocal :/etc/autofs\nlh localhost:/etc\n\
+                 lhro -ro localhost:/etc\nnob -nobind localhost:/etc\nnone nosuchhost:/x\nw tarn(3):/w\n\
+                 opts -vers=3,proto=tcp,port=2049,rsize=8192 ronda:/o\nsp -fstype=nfs \"ronda:/with space\"\n",
+            )
+            .steps(
+                "ready\ntrig /mnt/a/r; waitlog 'mounted /mnt/a/r'\ntrig /mnt/a/r4; waitlog 'mounted /mnt/a/r4'\n\
+                 trig /mnt/a/local/; waitlog 'mounted /mnt/a/local'\ntrig /mnt/a/lh/; waitlog 'mounted /mnt/a/lh'\n\
+                 trig /mnt/a/lhro/; waitlog 'mounted /mnt/a/lhro'\ntrig /mnt/a/none; waitlog 'failed to mount /mnt/a/none'\n\
+                 trig /mnt/a/w; waitlog 'mounted /mnt/a/w'\ntrig /mnt/a/opts; waitlog 'mounted /mnt/a/opts'\n\
+                 trig '/mnt/a/sp'; waitlog '/mnt/a/sp'; quiet 0.5\nsnap\n",
+            ),
+    );
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_nfs_hydra_net() {
+    // hydra's /net: a program map answering with a multi-mount of NFSv4
+    // mounts, one per export from showmount (faked).
+    let netv4 = "#!/bin/bash\nkey=\"$1\"\nopts=\"-fstype=nfs4,hard,nodev,nosuid\"\nSMNT=/etc/autofs/showmount\n\
+                 $SMNT --no-headers -e $key | LC_ALL=C cut -d' ' -f1 | LC_ALL=C head -n1 | \\\n\
+                 awk -v key=\"$key\" -v opts=\"$opts\" -- '\n\
+                 BEGIN { ORS=\"\"; first=1 }\n { if (first) { print opts; first=0 }; print \" \\\\\\n\\t\" \"/\", key \":\" \"/\" }\n\
+                 END { if (!first) print \"\\n\"; else exit 1 }\n' | sed 's/#/\\\\#/g'\n";
+    let showmount = "#!/bin/sh\n[ \"$3\" = ronda ] && printf '/ 192.168.1.0/24\\n/media 192.168.1.0/24\\n'\nexit 0\n";
+    // With no server answering (ronda is unreachable), then with one.
+    for (name, hosts, net) in
+        [("d_nfs_hydra", HOSTS.to_string(), ""), ("d_nfs_hydra_srv", format!("{NETHOSTS}10.77.0.2 ronda\n"), NET)]
+    {
+        check_vm(
+        VmCase::new(name, "/net /etc/autofs/auto.netv4\n")
+            .etc("hosts", &hosts)
+            .net(net)
+            .etc_mode("autofs/auto.netv4", netv4, 0o755)
+            .etc_mode("autofs/showmount", showmount, 0o755)
+            .conf("[ autofs ]\ntimeout = 300\nbrowse_mode = no\nmount_nfs_default_protocol = 4\n")
+            .steps(
+                "waitlog 'mounted indirect on /net'; quiet 0.3\ntrig /net/ronda; waitlog 'mounted /net/ronda'; quiet 0.5\n\
+                 trig /net/nohost; waitlog 'failed to mount /net/nohost'\nsnap\nstopd\n",
+            ),
+    );
+    }
+}
+
+// Fake servers (fake-nfsd) for probing: 10.77.0.x in the case's subnet,
+// 10.78.0.2 on the same network, 192.0.2.2 further; 10.77.0.9 is nobody.
+const NET: &str = "10.77.0.2 tcp 3,4\n10.77.0.2 udp 3\n10.77.0.3 tcp 3 delay=150\n10.77.0.3 udp 3 delay=150\n\
+                   10.77.0.4 tcp 2,3\n10.78.0.2 tcp 3,4\n192.0.2.2 tcp 3\n";
+const NETHOSTS: &str = "127.0.0.1 localhost\n10.77.0.2 s2\n10.77.0.3 s3\n10.77.0.4 s4\n10.78.0.2 n2\n\
+                        192.0.2.2 o2\n10.77.0.9 dead\n10.77.0.2 rr\n10.77.0.3 rr\n";
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_nfs_replicated() {
+    check_vm(
+        VmCase::new("d_nfs_rep", "/mnt/a /etc/autofs/auto.a\n")
+            .net(NET)
+            .etc("hosts", NETHOSTS)
+            .map(
+                "auto.a",
+                "rep s3,s2:/r\nuw -use-weight-only s2(5),s3(1):/uw\nprox o2:/p n2:/p s4:/p\ndead dead,s2:/d\n\
+                 v4 -vers=4 s3,s2:/v4\nudp -proto=udp s3,s2:/u\npt -port=2049 s3,s2:/pt\nmix localhost:/etc s2:/m\n\
+                 none s4,o2:/n\nrr rr:/rr\nsingle s3:/one\nsdead dead:/sd\nuwp -use-weight-only o2(1),s3(5):/uwp\n",
+            )
+            .steps(
+                "ready\ntrig /mnt/a/rep; waitlog 'mounted /mnt/a/rep'\ntrig /mnt/a/uw; waitlog 'mounted /mnt/a/uw'\n\
+                 trig /mnt/a/prox; waitlog 'mounted /mnt/a/prox'\ntrig /mnt/a/dead; waitlog 'mounted /mnt/a/dead' 200\n\
+                 trig /mnt/a/v4; waitlog 'mounted /mnt/a/v4'\ntrig /mnt/a/udp; waitlog 'mounted /mnt/a/udp'\n\
+                 trig /mnt/a/pt; waitlog 'mounted /mnt/a/pt'\ntrig /mnt/a/mix/; waitlog 'mounted /mnt/a/mix'\n\
+                 trig /mnt/a/none; waitlog '/mnt/a/none' 200\ntrig /mnt/a/rr; waitlog '/mnt/a/rr' 200\n\
+                 trig /mnt/a/single; waitlog '/mnt/a/single'\ntrig /mnt/a/sdead; waitlog '/mnt/a/sdead' 200\ntrig /mnt/a/uwp; waitlog '/mnt/a/uwp' 200\nquiet 0.5\nsnap\n",
+            ),
+    );
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_nfs_v4_default() {
+    // mount_nfs_default_protocol = 4: a singleton is probed for v4 alone.
+    check_vm(
+        VmCase::new("d_nfs_v4def", "/mnt/a /etc/autofs/auto.a\n")
+            .net(NET)
+            .etc("hosts", NETHOSTS)
+            .conf("[ autofs ]\nmount_nfs_default_protocol = 4\n")
+            .map("auto.a", "a s2:/a\nb s3:/b\nc s4:/c\nd -fstype=nfs4 s2:/d\ne -proto=udp s3:/e\nf s2,s3:/f\n")
+            .steps(
+                "ready\ntrig /mnt/a/a; waitlog 'mounted /mnt/a/a'\ntrig /mnt/a/b; waitlog '/mnt/a/b'\n\
+                 trig /mnt/a/c; waitlog '/mnt/a/c'\ntrig /mnt/a/d; waitlog '/mnt/a/d'\ntrig /mnt/a/e; waitlog '/mnt/a/e'\n\
+                 trig /mnt/a/f; waitlog '/mnt/a/f'\nquiet 0.5\nsnap\n",
+            ),
+    );
+}

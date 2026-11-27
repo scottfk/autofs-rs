@@ -128,11 +128,21 @@ The last section lists where the port can't or doesn't follow C, and why.
 | low | `afs` entries fail on current kernels: the kernel has already made the key's directory, so the module's `symlink()` gets `EEXIST`. | `mount_afs` | `daemon_mount_modules` |
 | low | With several mounts, the order in which they shut down, reload or expire is a race between threads (and between `stderr` writes, which can run two messages together); C's own log order varies from run to run. | `state::st_queue_handler` | `daemon_two_mounts_and_null`, `daemon_hup_reload` (compared unordered) |
 
+## NFS mounts (modules/mount_nfs.c, modules/replicated.c, lib/rpc_subs.c)
+
+| Severity | Quirk | Where | Test |
+|---|---|---|---|
+| low | A host whose name gives 127.0.0.1 and one other IPv4 address counts as round robin (and is mounted by address): the loopback check compares the network-order address with the host-order `INADDR_LOOPBACK`. | `replicated::add_host_addrs` | - |
+| low | Blanks after an NFS option are never skipped: the loop that should step back over them tests the `,` (or NUL) it stopped at. | `mount_nfs` | - |
+| low | A host that can't be looked up skips its `host:/path` entry only if no host was listed alone before it (`a,`): after one (`empty` is cleared there and nowhere else), the path still goes to the hosts gathered so far. | `replicated::parse_location` | `daemon_nfs_single_hosts` (`none`) |
+| low | A host's `addr_len` is `INET_ADDRSTRLEN` or `INET6_ADDRSTRLEN`, not the address's size, and `tcp6`/`udp6` skip IPv4 hosts by comparing it with `INET_ADDRSTRLEN`. | `replicated::add_new_host`, `replicated::check_address_proto` | - |
+| low | The `nosymlink` warning says "depricated". | `mount_nfs` | - |
+
 ## Startup (daemon/automount.c, lib/mounts.c)
 
 | Severity | Quirk | Where | Test |
 |---|---|---|---|
-| low | `check_nfs_mount_version()` only looks for the nfs-utils version in output without a trailing newline, and `mount.nfs -V` ends its line with one, so `nfs_mount_uses_string_options` is always 0. | `automount::check_nfs_mount_version` | every case (`mount.nfs -V` is run and recorded) |
+| low | `check_nfs_mount_version()` looks for the nfs-utils version in its buffer after every read, a C string from the start: the first line of a read (cut at its newline), or what was left of the last one moved to the front. `mount.nfs -V` gives one line, so `nfs_mount_uses_string_options` is 1 with nfs-utils 1.1.1 or later, and single NFS hosts are probed (unless `mount_wait` is set). | `automount::check_nfs_mount_version` | every case (`mount.nfs -V` is run and recorded), `daemon_nfs_hydra_net` |
 | low | `-V` lists `LIBXML2_WORKAROUND`, which `config.h` defines even without LDAP. | `automount::show_build_info` | `opt_version` |
 | low | Opening the `sun` parser (for any map) opens the NFS and bind mount modules, and the bind module checks that bind mounts work by mounting one `/tmp/autoXXXXXX` directory on another, even for `--dumpmaps`. | `mount_bind::mount_init` | every dump case (`cmds`) |
 
@@ -149,4 +159,7 @@ The last section lists where the port can't or doesn't follow C, and why.
 | A busy expire or map read thread that's asked to cancel stops at the point C tests for a cancel (`pthread_testcancel()`) or between steps, not at any cancellation point (`read()`, `nanosleep()`...) inside. | Rust has no thread cancellation. |
 | An autofs point's pipe and ioctl descriptors start as 0: C `malloc()`s the structure and only sets them when it opens the pipe, so with `-U` they're whatever the memory held (0 on a fresh heap). | Uninitialized memory. |
 | Restarting over a mounted multi-mount in a direct map reconnects to it. C deadlocks there: `mount_autofs_direct()` holds the map cache's read lock while it reconnects each trigger, and re-reading the multi-mount entry takes the same cache's write lock (`cache_writelock()` in the same thread), so the daemon hangs at startup. | An upstream self-deadlock; the port's cache locks are only held briefly. Not compared (`daemon_restart_direct` leaves the multi-mount unmounted). |
+| "error 0x%d getting portmap client" and "error 0x%d getting service port" have no argument for their `%d`, so C prints whatever a register held; the port prints the status. | Undefined behavior. |
+| A bracketed host (`[addr]:/path`) that's neither numeric nor found makes C `free()` a pointer one byte into its copy of the name, and glibc aborts; the port logs the failed lookup and goes on to the next host. | An invalid `free()`. |
+| When a host name can't be looked up and there's no address, C goes on to call through a NULL client (`rpc_portmap_getport()`, `rpc_ping_proto()`: `create_client()` returns `getaddrinfo()`'s positive error, which the callers take for success); the port fails the call (`-EIO`). | A NULL pointer call. |
 | A panic (a path not ported yet) aborts the daemon, rather than leaving the kernel waiting on a request thread that's gone. | Only for what isn't ported. |

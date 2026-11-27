@@ -17,3 +17,4 @@ pub mod mount_generic;
 pub mod mount_nfs;
 pub mod parse_amd;
 pub mod parse_sun;
+pub mod replicated;

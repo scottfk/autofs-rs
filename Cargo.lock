@@ -7,6 +7,7 @@ name = "automount"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "tirpc",
 ]
 
 [[package]]
@@ -14,3 +15,11 @@ name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+
+[[package]]
+name = "tirpc"
+version = "0.1.0"
+source = "git+https://github.com/scottfk/rpcbind-rs?rev=a9a5199dc95bcfc5c88c62f101cb634c5b3df5b7#a9a5199dc95bcfc5c88c62f101cb634c5b3df5b7"
+dependencies = [
+ "libc",
+]
