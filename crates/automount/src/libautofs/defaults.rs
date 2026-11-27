@@ -18,6 +18,10 @@ use crate::libautofs::cstr::{caseeq, ncaseeq};
 use crate::libautofs::log;
 use crate::sys;
 
+/// `--with-fifodir` (Gentoo's `/run`).
+pub const AUTOFS_FIFO_DIR: &[u8] = b"/run";
+/// `--with-flagdir`.
+pub const AUTOFS_FLAG_DIR: &[u8] = b"/run";
 pub const AUTOFS_MAP_DIR: &[u8] = b"/etc/autofs";
 pub const AUTOFS_CONF_DIR: &[u8] = b"/etc/conf.d";
 pub const AUTOFS_LIB_DIR: &[u8] = b"/usr/lib64/autofs";

@@ -611,30 +611,37 @@ pub fn getopt_long(argv: &[Vec<u8>], optstring: &CStr, long: &[(&'static CStr, c
     }
 }
 
-/// The mount half of `query_kproto_ver()`: a pipe (not CLOEXEC: plain
-/// `pipe()`), and an autofs mount of it on `dir`. `false` if the mount fails;
-/// if it works, it's undone again and the protocol is taken to be 5.
-pub fn autofs_test_mount(dir: &[u8]) -> bool {
+/// `query_kproto_ver()`'s test mount: mount autofs on `dir` with a pipe as its
+/// kernel end; (the read end of the pipe, the mount's device) if it worked.
+/// On failure nothing is left mounted or open.
+pub fn autofs_test_mount_keep(dir: &[u8]) -> Option<(Fd, u64)> {
     let mut fds = [0 as c_int; 2];
     // SAFETY: fds has room for two ints.
     if unsafe { libc::pipe(fds.as_mut_ptr()) } == -1 {
-        return false;
+        return None;
     }
-    // SAFETY: no preconditions.
-    let pgrp = unsafe { libc::getpgrp() };
+    let pgrp = getpgrp();
     let opts = format!("fd={},pgrp={},minproto=3,maxproto=5", fds[1], pgrp as u32);
-    let (src, d, ty, o) = (cstring(b"automount"), cstring(dir), cstring(b"autofs"), cstring(opts.as_bytes()));
-    // SAFETY: valid C strings; MS_MGC_VAL as the flags, as C passes it.
-    let r = unsafe { libc::mount(src.as_ptr(), d.as_ptr(), ty.as_ptr(), libc::MS_MGC_VAL, o.as_ptr().cast()) };
-    if r != 0 {
+    if mount(b"automount", dir, b"autofs", libc::MS_MGC_VAL, Some(opts.as_bytes())) != 0 {
         close(fds[0]);
         close(fds[1]);
-        return false;
+        return None;
     }
     close(fds[1]);
-    umount(dir);
-    close(fds[0]);
-    true
+    match stat(dir) {
+        Some(st) => Some((fds[0], st.st_dev)),
+        None => {
+            umount(dir);
+            close(fds[0]);
+            None
+        }
+    }
+}
+
+/// `getpgrp()`.
+pub fn getpgrp() -> i32 {
+    // SAFETY: plain call.
+    unsafe { libc::getpgrp() }
 }
 
 /// `getdomainname()`.
@@ -1022,4 +1029,409 @@ pub fn xpg_dirname(s: &[u8]) -> Vec<u8> {
         let r = libc::dirname(c.as_mut_ptr() as *mut c_char);
         CStr::from_ptr(r).to_bytes().to_vec()
     }
+}
+
+// ---------------------------------------------------------------------------
+// The daemon: the autofs ioctls, mounts, signals and processes.
+
+/// `struct autofs_dev_ioctl` (linux/auto_dev-ioctl.h), with room for a path.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct AutofsDevIoctl {
+    pub ver_major: u32,
+    pub ver_minor: u32,
+    pub size: u32,
+    pub ioctlfd: i32,
+    /// The parameter union: 8 bytes, 8-aligned (`args_timeout` is a `__u64`).
+    pub arg: [u32; 2],
+}
+
+pub const AUTOFS_DEV_IOCTL_SIZE: usize = std::mem::size_of::<AutofsDevIoctl>();
+
+const fn iowr(nr: u64, size: u64) -> u64 {
+    (3 << 30) | (size << 16) | (0x93 << 8) | nr
+}
+const fn io(nr: u64) -> u64 {
+    (0x93 << 8) | nr
+}
+const fn ior(nr: u64, size: u64) -> u64 {
+    (2 << 30) | (size << 16) | (0x93 << 8) | nr
+}
+const fn iow(nr: u64, size: u64) -> u64 {
+    (1 << 30) | (size << 16) | (0x93 << 8) | nr
+}
+
+pub const AUTOFS_DEV_IOCTL_VERSION: u64 = iowr(0x71, 24);
+pub const AUTOFS_DEV_IOCTL_PROTOVER: u64 = iowr(0x72, 24);
+pub const AUTOFS_DEV_IOCTL_PROTOSUBVER: u64 = iowr(0x73, 24);
+pub const AUTOFS_DEV_IOCTL_OPENMOUNT: u64 = iowr(0x74, 24);
+pub const AUTOFS_DEV_IOCTL_READY: u64 = iowr(0x76, 24);
+pub const AUTOFS_DEV_IOCTL_FAIL: u64 = iowr(0x77, 24);
+pub const AUTOFS_DEV_IOCTL_SETPIPEFD: u64 = iowr(0x78, 24);
+pub const AUTOFS_DEV_IOCTL_CATATONIC: u64 = iowr(0x79, 24);
+pub const AUTOFS_DEV_IOCTL_TIMEOUT: u64 = iowr(0x7a, 24);
+pub const AUTOFS_DEV_IOCTL_REQUESTER: u64 = iowr(0x7b, 24);
+pub const AUTOFS_DEV_IOCTL_EXPIRE: u64 = iowr(0x7c, 24);
+pub const AUTOFS_DEV_IOCTL_ASKUMOUNT: u64 = iowr(0x7d, 24);
+pub const AUTOFS_DEV_IOCTL_ISMOUNTPOINT: u64 = iowr(0x7e, 24);
+
+pub const AUTOFS_IOC_READY: u64 = io(0x60);
+pub const AUTOFS_IOC_FAIL: u64 = io(0x61);
+pub const AUTOFS_IOC_CATATONIC: u64 = io(0x62);
+pub const AUTOFS_IOC_PROTOVER: u64 = ior(0x63, 4);
+pub const AUTOFS_IOC_SETTIMEOUT: u64 = iowr(0x64, 8);
+pub const AUTOFS_IOC_EXPIRE_MULTI: u64 = iow(0x66, 4);
+pub const AUTOFS_IOC_PROTOSUBVER: u64 = ior(0x67, 4);
+pub const AUTOFS_IOC_ASKUMOUNT: u64 = ior(0x70, 4);
+
+/// `ioctl(fd, req, buf)` with a `struct autofs_dev_ioctl` and its path
+/// (`buf` holds the struct, then the path's bytes and a NUL).
+pub fn ioctl_dev(fd: Fd, req: u64, buf: &mut [u8]) -> i32 {
+    // SAFETY: buf is at least AUTOFS_DEV_IOCTL_SIZE bytes, 8-aligned by the
+    // caller's allocation (a Vec<u64> viewed as bytes), and as long as the
+    // struct's size field says.
+    unsafe { libc::ioctl(fd, req as libc::c_ulong, buf.as_mut_ptr()) }
+}
+
+/// `ioctl(fd, req, &int)`.
+pub fn ioctl_int_ptr(fd: Fd, req: u64, v: &mut u32) -> i32 {
+    // SAFETY: v is a valid int out pointer.
+    unsafe { libc::ioctl(fd, req as libc::c_ulong, v as *mut u32) }
+}
+
+/// `ioctl(fd, req, &long)`.
+pub fn ioctl_long_ptr(fd: Fd, req: u64, v: &mut i64) -> i32 {
+    // SAFETY: v is a valid long pointer.
+    unsafe { libc::ioctl(fd, req as libc::c_ulong, v as *mut i64) }
+}
+
+/// `ioctl(fd, req, val)` with an integer argument.
+pub fn ioctl_val(fd: Fd, req: u64, val: libc::c_ulong) -> i32 {
+    // SAFETY: the argument is passed by value.
+    unsafe { libc::ioctl(fd, req as libc::c_ulong, val) }
+}
+
+/// `mount(source, target, fstype, flags, data)`.
+pub fn mount(source: &[u8], target: &[u8], fstype: &[u8], flags: libc::c_ulong, data: Option<&[u8]>) -> i32 {
+    let (s, t, f) = (cstring(source), cstring(target), cstring(fstype));
+    let d = data.map(cstring);
+    // SAFETY: valid C strings; data may be null.
+    unsafe {
+        libc::mount(
+            s.as_ptr(),
+            t.as_ptr(),
+            f.as_ptr(),
+            flags,
+            d.as_ref().map_or(std::ptr::null(), |d| d.as_ptr().cast()),
+        )
+    }
+}
+
+/// `umount2(path, flags)`.
+pub fn umount2(path: &[u8], flags: c_int) -> i32 {
+    let p = cstring(path);
+    // SAFETY: p is a valid C string.
+    unsafe { libc::umount2(p.as_ptr(), flags) }
+}
+
+/// `chmod(path, mode)`.
+pub fn chmod(path: &[u8], mode: u32) -> i32 {
+    let p = cstring(path);
+    // SAFETY: p is a valid C string.
+    unsafe { libc::chmod(p.as_ptr(), mode) }
+}
+
+/// `umask(mask)`: the old mask.
+pub fn umask(mask: u32) -> u32 {
+    // SAFETY: umask can't fail.
+    unsafe { libc::umask(mask) }
+}
+
+/// `mkfifo(path, mode)`.
+pub fn mkfifo(path: &[u8], mode: u32) -> i32 {
+    let p = cstring(path);
+    // SAFETY: p is a valid C string.
+    unsafe { libc::mkfifo(p.as_ptr(), mode) }
+}
+
+/// `link(old, new)`.
+pub fn link(old: &[u8], new: &[u8]) -> i32 {
+    let (o, n) = (cstring(old), cstring(new));
+    // SAFETY: valid C strings.
+    unsafe { libc::link(o.as_ptr(), n.as_ptr()) }
+}
+
+/// `open(path, flags | O_CLOEXEC, mode)` (`open_fd_mode()`).
+pub fn open_mode(path: &[u8], flags: c_int, mode: u32) -> Fd {
+    let p = cstring(path);
+    // SAFETY: p is a valid C string.
+    unsafe { libc::open(p.as_ptr(), flags | libc::O_CLOEXEC, mode) }
+}
+
+/// `lseek(fd, 0, SEEK_SET)`.
+pub fn rewind(fd: Fd) -> i64 {
+    // SAFETY: plain call.
+    unsafe { libc::lseek(fd, 0, libc::SEEK_SET) }
+}
+
+/// `getpid()`.
+pub fn getpid() -> i32 {
+    // SAFETY: plain call.
+    unsafe { libc::getpid() }
+}
+
+/// `fork()`.
+pub fn fork() -> i32 {
+    // SAFETY: called while the process has one thread (become_daemon()).
+    unsafe { libc::fork() }
+}
+
+/// `setsid()`.
+pub fn setsid() -> i32 {
+    // SAFETY: plain call.
+    unsafe { libc::setsid() }
+}
+
+/// `dup2(old, new)`.
+pub fn dup2(old: Fd, new: Fd) -> i32 {
+    // SAFETY: plain call.
+    unsafe { libc::dup2(old, new) }
+}
+
+/// `sched_yield()`.
+pub fn sched_yield() {
+    // SAFETY: plain call.
+    unsafe { libc::sched_yield() };
+}
+
+/// `nanosleep()` of `ns` nanoseconds, resumed after signals as autofs does.
+pub fn sleep_ns(ns: i64) {
+    let mut t = libc::timespec { tv_sec: ns / 1_000_000_000, tv_nsec: ns % 1_000_000_000 };
+    loop {
+        let mut r = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: valid timespecs.
+        if unsafe { libc::nanosleep(&t, &mut r) } == -1 && errno() == libc::EINTR {
+            t = r;
+            continue;
+        }
+        break;
+    }
+}
+
+/// One `nanosleep()` of `ns` nanoseconds: -1 if a signal interrupted it.
+pub fn nanosleep_once(ns: i64) -> i32 {
+    let t = libc::timespec { tv_sec: ns / 1_000_000_000, tv_nsec: ns % 1_000_000_000 };
+    // SAFETY: valid timespec; the remainder isn't wanted.
+    unsafe { libc::nanosleep(&t, std::ptr::null_mut()) }
+}
+
+/// `fstatfs(fd).f_type`.
+pub fn fstatfs_type(fd: Fd) -> Option<i64> {
+    // SAFETY: zeroed statfs is a valid out buffer.
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: valid arguments.
+    if unsafe { libc::fstatfs(fd, &mut fs) } != 0 {
+        return None;
+    }
+    Some(fs.f_type as i64)
+}
+
+/// A signal set.
+pub fn sigset(sigs: &[c_int]) -> libc::sigset_t {
+    // SAFETY: plain signal set calls.
+    unsafe {
+        let mut s: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut s);
+        for &g in sigs {
+            libc::sigaddset(&mut s, g);
+        }
+        s
+    }
+}
+
+/// Every signal but `except`.
+pub fn sigset_all_but(except: &[c_int]) -> libc::sigset_t {
+    // SAFETY: plain signal set calls.
+    unsafe {
+        let mut s: libc::sigset_t = std::mem::zeroed();
+        libc::sigfillset(&mut s);
+        for &g in except {
+            libc::sigdelset(&mut s, g);
+        }
+        s
+    }
+}
+
+/// `pthread_sigmask(how, set, &old)`: the old mask.
+pub fn sigmask(how: c_int, set: &libc::sigset_t) -> libc::sigset_t {
+    // SAFETY: valid sigsets.
+    unsafe {
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::pthread_sigmask(how, set, &mut old);
+        old
+    }
+}
+
+/// The calling thread's signal mask.
+pub fn current_sigmask() -> libc::sigset_t {
+    // SAFETY: a null set queries the mask.
+    unsafe {
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut old);
+        old
+    }
+}
+
+extern "C" fn dummy_handler(_sig: c_int) {}
+
+/// `sigaction(sig, {dummy handler, empty mask, no flags})`.
+pub fn set_dummy_handler(sig: c_int) -> i32 {
+    // SAFETY: an initialized sigaction with a handler that does nothing.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = dummy_handler as *const () as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = 0;
+        libc::sigaction(sig, &sa, std::ptr::null_mut())
+    }
+}
+
+/// `sigwait(set)`: the signal.
+pub fn sigwait(set: &libc::sigset_t) -> c_int {
+    let mut sig: c_int = 0;
+    // SAFETY: valid set and out pointer.
+    unsafe { libc::sigwait(set, &mut sig) };
+    sig
+}
+
+/// `ppoll(&{fd, POLLIN}, 1, NULL, mask)`: the result, the events, errno.
+pub fn ppoll_in(fd: Fd, mask: &libc::sigset_t) -> (i32, i16, i32) {
+    let mut p = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    set_errno(0);
+    // SAFETY: one valid pollfd, a valid mask.
+    let r = unsafe { libc::ppoll(&mut p, 1, std::ptr::null(), mask) };
+    (r, p.revents, errno())
+}
+
+/// `pthread_self()`.
+pub fn pthread_self() -> u64 {
+    // SAFETY: plain call.
+    unsafe { libc::pthread_self() as u64 }
+}
+
+/// `pthread_kill(thread, sig)`.
+pub fn pthread_kill(thread: u64, sig: c_int) -> i32 {
+    // SAFETY: the thread id comes from pthread_self() of a live thread.
+    unsafe { libc::pthread_kill(thread as libc::pthread_t, sig) }
+}
+
+/// `read()` until `buf` is full or an error (`fullread()`): what's left.
+pub fn fullread(fd: Fd, buf: &mut [u8]) -> usize {
+    let mut off = 0;
+    while off < buf.len() {
+        // SAFETY: the slice is valid for the length given.
+        let r = unsafe { libc::read(fd, buf[off..].as_mut_ptr().cast(), buf.len() - off) };
+        if r == -1 {
+            if errno() == libc::EINTR {
+                continue;
+            }
+            break;
+        }
+        off += r as usize;
+    }
+    buf.len() - off
+}
+
+/// `scandir(dir, ..., alphasort)` names (C locale), including `.` and `..`.
+pub fn scandir_alpha(dir: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let d = cstring(dir);
+    // SAFETY: opendir/readdir/closedir on a valid C string; names are copied.
+    unsafe {
+        let dp = libc::opendir(d.as_ptr());
+        if dp.is_null() {
+            return None;
+        }
+        let mut out = Vec::new();
+        loop {
+            let e = libc::readdir(dp);
+            if e.is_null() {
+                break;
+            }
+            out.push(CStr::from_ptr((*e).d_name.as_ptr()).to_bytes().to_vec());
+        }
+        libc::closedir(dp);
+        out.sort();
+        Some(out)
+    }
+}
+
+/// `uname().release`.
+pub fn uname_release() -> Vec<u8> {
+    // SAFETY: zeroed utsname is a valid out buffer.
+    let mut u: libc::utsname = unsafe { std::mem::zeroed() };
+    // SAFETY: valid out pointer.
+    unsafe { libc::uname(&mut u) };
+    // SAFETY: uname NUL-terminates.
+    unsafe { CStr::from_ptr(u.release.as_ptr()).to_bytes().to_vec() }
+}
+
+/// `write(fd, buf)`, all of it or -1.
+pub fn write_all(fd: Fd, buf: &[u8]) -> isize {
+    // SAFETY: the slice is valid for its length.
+    unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) }
+}
+
+/// `kill(pid, 0)`: 0, or -1 with errno.
+pub fn kill0(pid: i32) -> i32 {
+    // SAFETY: signal 0 only checks.
+    unsafe { libc::kill(pid, 0) }
+}
+
+/// `struct autofs_v5_packet` (linux/auto_fs4.h): 304 bytes on x86_64.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct AutofsV5Packet {
+    pub proto_version: i32,
+    pub ty: i32,
+    pub wait_queue_token: u32,
+    pub dev: u32,
+    pub ino: u64,
+    pub uid: u32,
+    pub gid: u32,
+    pub pid: u32,
+    pub tgid: u32,
+    pub len: u32,
+    pub name: [u8; 256],
+}
+
+impl std::fmt::Debug for AutofsV5Packet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "packet type {} token {}", self.ty, self.wait_queue_token)
+    }
+}
+
+impl AutofsV5Packet {
+    pub fn zeroed() -> AutofsV5Packet {
+        // SAFETY: plain integers and bytes.
+        unsafe { std::mem::zeroed() }
+    }
+
+    /// The name, `len` bytes (as `strncpy(name, pkt->name, pkt->len)` reads it).
+    pub fn name_bytes(&self) -> &[u8] {
+        let l = (self.len as usize).min(self.name.len());
+        crate::libautofs::cstr::c(&self.name[..l])
+    }
+
+    /// The packet as bytes, to read into.
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: a repr(C) struct of plain fields.
+        unsafe { std::slice::from_raw_parts_mut(self as *mut Self as *mut u8, std::mem::size_of::<Self>()) }
+    }
+}
+
+/// `mount(NULL, target, NULL, flags, NULL)` (a propagation change).
+pub fn mount_flags_only(target: &[u8], flags: libc::c_ulong) -> i32 {
+    let t = cstring(target);
+    // SAFETY: a valid target; the rest may be null for a propagation change.
+    unsafe { libc::mount(std::ptr::null(), t.as_ptr(), std::ptr::null(), flags, std::ptr::null()) }
 }
