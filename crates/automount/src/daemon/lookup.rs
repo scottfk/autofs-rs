@@ -426,35 +426,158 @@ pub fn lookup_close_lookup(ap: &Arc<AutofsPoint>) {
     }
 }
 
+/// `make_fullpath()`: a key's mount point.
+fn make_fullpath(ap: &Arc<AutofsPoint>, key: &[u8]) -> Option<Vec<u8>> {
+    if key.first() != Some(&b'/') {
+        let (path, pref) = {
+            let a = ap.lock();
+            (a.path.clone(), a.pref.clone())
+        };
+        make_browse_path(&path, key, pref.as_deref())
+    } else {
+        if key.len() + 1 > 255 {
+            return None;
+        }
+        Some(key.to_vec())
+    }
+}
+
+/// `lookup_source_valid_mapent()`: the first entry for `key` in a map source
+/// read since the master map entry changed.
+pub fn lookup_source_valid_mapent(
+    ap: &Arc<AutofsPoint>,
+    key: &[u8],
+    distinct: bool,
+) -> Option<(Arc<crate::libautofs::cache::Cache>, crate::libautofs::cache::Pos)> {
+    let entry = ap.entry();
+    let eage = entry.lock().age;
+    for map in entry.maps() {
+        if eage > map.lock().age {
+            continue;
+        }
+        let mc = map.mc();
+        let p = {
+            let c = mc.lock();
+            if distinct { c.lookup_distinct(key) } else { c.lookup(key) }
+        };
+        if let Some(p) = p {
+            return Some((mc, p));
+        }
+    }
+    None
+}
+
+/// `lookup_prune_one_cache()`: drop the entries a map read didn't see, unless
+/// they're mounted (or, without browsing, younger than the positive timeout).
+pub fn lookup_prune_one_cache(ap: &Arc<AutofsPoint>, mc: &Arc<crate::libautofs::cache::Cache>, age: i64) {
+    use crate::daemon::master::{MOUNT_FLAG_AMD_CACHE_ALL, MOUNT_FLAG_GHOST};
+    use crate::libautofs::cache::CHE_FAIL;
+    use crate::libautofs::mounts::{MNTS_AUTOFS, MNTS_REAL};
+    let logopt = ap.logopt();
+    let (ty, flags, positive_timeout) = {
+        let a = ap.lock();
+        (a.ty, a.flags, a.positive_timeout as i64)
+    };
+    let mut cur = mc.lock().enumerate(None);
+    while let Some(p) = cur {
+        let e = {
+            let mut c = mc.lock();
+            if p.0 >= c.hash.len() || p.1 >= c.hash[p.0].len() {
+                break;
+            }
+            let e = c.get(p).clone();
+            let mut skip = false;
+            if e.age >= age {
+                // Retry valid entries (and ones a failed wildcard lookup made).
+                if e.mapent.is_some() || c.lookup(b"*").is_some() {
+                    c.get_mut(p).status = 0;
+                }
+                skip = true;
+            } else if ty == LKP_INDIRECT {
+                // Offsets are managed by expire; a multi-mount's owner stays.
+                if e.key.first() == Some(&b'/') || (e.mm && !e.mm_nonroot) {
+                    skip = true;
+                } else if flags & (MOUNT_FLAG_GHOST | MOUNT_FLAG_AMD_CACHE_ALL) == 0 {
+                    // An unread map keeps entries for the positive timeout.
+                    let until = e.age + positive_timeout;
+                    if age - until < 0 {
+                        skip = true;
+                    }
+                }
+            }
+            if !skip && cstr::strchr(&e.key, b'*').is_some() {
+                skip = true;
+            }
+            if skip {
+                cur = c.enumerate(Some(p));
+                continue;
+            }
+            e
+        };
+        let key = cstr::c(&e.key).to_vec();
+        let Some(path) = make_fullpath(ap, &key) else {
+            warn!(logopt, "can't malloc storage for path");
+            cur = mc.lock().enumerate(Some(p));
+            continue;
+        };
+        // Another valid entry for the key takes the mount (or this is just
+        // a stale indirect entry).
+        let mut valid = lookup_source_valid_mapent(ap, &key, true);
+        if let Some((vmc, vp)) = &valid
+            && Arc::ptr_eq(vmc, mc)
+        {
+            debug!(logopt, "lookup_prune_one_cache", "removed map entry detected, mark negative");
+            vmc.lock().get_mut(*vp).mapent = None;
+            valid = None;
+        }
+        if valid.is_none() && crate::libautofs::mounts::is_mounted(&path, MNTS_REAL) {
+            debug!(logopt, "lookup_prune_one_cache", "prune postponed, {} mounted", path);
+            cur = mc.lock().enumerate(Some(p));
+            continue;
+        }
+        let next_key = {
+            let c = mc.lock();
+            c.enumerate(Some(p)).map(|n| c.get(n).key.clone())
+        };
+        let this = {
+            let c = mc.lock();
+            c.lookup_distinct(&key).map(|q| (c.get(q).ioctlfd, c.get(q).dev))
+        };
+        if let Some((ioctlfd, edev)) = this {
+            if valid.is_some() {
+                mc.lock().delete(&key);
+            } else if !crate::libautofs::mounts::is_mounted(&path, MNTS_AUTOFS) {
+                let devid = if ty == master::LKP_DIRECT { edev } else { ap.lock().dev };
+                let mut status = CHE_FAIL;
+                if ioctlfd == -1 {
+                    status = mc.lock().delete(&key);
+                }
+                if status != CHE_FAIL && (ty != LKP_INDIRECT || flags & MOUNT_FLAG_GHOST != 0) {
+                    crate::daemon::automount::rmdir_path(ap, &path, devid);
+                }
+            }
+        }
+        cur = match next_key {
+            Some(k) => mc.lock().lookup_distinct(&k),
+            None => None,
+        };
+    }
+}
+
 /// `lookup_prune_cache()`.
-///
-/// Map reads mark every entry they see with the read's age, so in a dump there
-/// is nothing older to prune; pruning what a reread no longer has (and the
-/// mounts that keep entries alive) comes with the daemon in phase 3. What's
-/// here is the part a dump does: resetting the status of current entries, and
-/// clearing the stale flags.
 pub fn lookup_prune_cache(ap: &Arc<AutofsPoint>, age: i64) -> bool {
-    for map in ap.entry().maps() {
+    let entry = ap.entry();
+    entry.source_readlock();
+    for map in entry.maps() {
         if !map.lock().stale && !master::check_stale_instances(&map) {
             continue;
         }
         let mc = map.mc();
-        {
-            let mut c = mc.lock();
-            let mut p = c.enumerate(None);
-            while let Some(pos) = p {
-                if c.get(pos).age >= age {
-                    let reset = c.get(pos).mapent.is_some() || c.lookup(b"*").is_some();
-                    if reset {
-                        c.get_mut(pos).status = 0;
-                    }
-                }
-                p = c.enumerate(Some(pos));
-            }
-        }
+        lookup_prune_one_cache(ap, &mc, age);
         master::clear_stale_instances(&map);
         map.lock().stale = false;
     }
+    entry.source_unlock();
     true
 }
 
@@ -729,7 +852,9 @@ pub fn lookup_nss_mount(ap: &Arc<AutofsPoint>, source: Option<&Arc<MapSource>>, 
         }
         i += 1;
     }
-    // ap->state is ST_INIT outside the daemon: no map update request.
+    if ap.lock().state != crate::daemon::state::ST_INIT {
+        master::send_map_update_request(ap);
+    }
     if result == NSS_STATUS_NOTFOUND || result == NSS_STATUS_UNAVAIL {
         update_negative_cache(ap, source, name);
     }
@@ -757,27 +882,9 @@ fn make_browse_path(root: &[u8], key: &[u8], prefix: Option<&[u8]>) -> Option<Ve
     Some(path)
 }
 
-/// `mkdir_path()`: each component that doesn't exist, with `mode`.
+/// `mkdir_path()` (in `automount.c`), with its `errno` as the error.
 pub fn mkdir_path(path: &[u8], mode: u32) -> Result<(), i32> {
-    let mut i = 1;
-    while i <= path.len() {
-        if i == path.len() || path[i] == b'/' {
-            let comp = &path[..i];
-            if sys::stat(comp).is_some() {
-                if i == path.len() {
-                    let st = sys::stat(comp).unwrap();
-                    return Err(if st.st_mode & libc::S_IFMT == libc::S_IFDIR { libc::EEXIST } else { libc::ENOTDIR });
-                }
-            } else if sys::mkdir(comp, mode) != 0 {
-                let e = sys::errno();
-                if i == path.len() {
-                    return Err(e);
-                }
-            }
-        }
-        i += 1;
-    }
-    Ok(())
+    if crate::daemon::automount::mkdir_path(path, mode) == 0 { Ok(()) } else { Err(sys::errno()) }
 }
 
 /// `lookup_ghost()`: make the browse directories of an indirect map.

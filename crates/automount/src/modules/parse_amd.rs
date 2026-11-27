@@ -1319,7 +1319,7 @@ impl ParseAmd {
             rv = amd_mount(ap, name, &mut this, &sv, flags);
             if rv == 0 {
                 if !cstr::eq(&s(&this.path), &mnt_mp) {
-                    mounts::mnts_add_mount(&ap.path(), &s(&this.rhost), MNTS_INDIRECT | MNTS_MOUNTED);
+                    mounts::mnts_add_mount(ap, &s(&this.rhost), MNTS_INDIRECT | MNTS_MOUNTED);
                 }
                 break;
             }

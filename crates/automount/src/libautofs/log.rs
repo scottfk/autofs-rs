@@ -83,16 +83,47 @@ pub fn set_log_debug(level: u32) {
     DEBUG_LEVEL.store(level, Ordering::Relaxed);
 }
 
-/// The common tail of every `log_*()`: syslog at `LOG_INFO` (see the module
-/// docs), or the message and a newline on stderr.
-fn emit(msg: &[u8]) {
+thread_local! {
+    /// `key_thread_attempt_id`: the mount request this thread works on.
+    static ATTEMPT_ID: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Set this thread's mount request id (`set_thread_mount_request_log_id()`).
+pub fn set_attempt_id(id: u64) {
+    ATTEMPT_ID.with(|a| a.set(Some(id)));
+}
+
+/// Whether this thread has a mount request id.
+pub fn has_attempt_id() -> bool {
+    ATTEMPT_ID.with(|a| a.get().is_some())
+}
+
+/// The common tail of every `log_*()`: syslog, or the message and a newline
+/// on stderr. With a mount request id (`prepare_attempt_prefix()`) the message
+/// gets `id|` in front and syslog gets `pri`; without, `LOG_INFO` (see the
+/// module docs).
+fn emit_pri(pri: libc::c_int, msg: &[u8]) {
+    let prefixed = ATTEMPT_ID.with(|a| a.get()).map(|id| {
+        let mut p = format!("{id:02x}").into_bytes();
+        p.truncate(23);
+        p.push(b'|');
+        p.extend_from_slice(msg);
+        p
+    });
     if LOGGING_TO_SYSLOG.load(Ordering::Relaxed) {
-        sys::syslog(libc::LOG_INFO, msg);
+        match &prefixed {
+            Some(p) => sys::syslog(pri, p),
+            None => sys::syslog(libc::LOG_INFO, msg),
+        }
     } else {
-        let mut m = msg.to_vec();
+        let mut m = prefixed.unwrap_or_else(|| msg.to_vec());
         m.push(b'\n');
         sys::write_stderr(&m);
     }
+}
+
+fn emit(msg: &[u8]) {
+    emit_pri(libc::LOG_INFO, msg);
 }
 
 /// `log_info()`.
@@ -101,41 +132,50 @@ pub fn log_info(logopt: u32, msg: &[u8]) {
     if !have_log_debug() && !have_log_verbose() && opt_log == 0 {
         return;
     }
-    emit(msg);
+    emit_pri(libc::LOG_INFO, msg);
+}
+
+fn verbose_or_debug(logopt: u32) -> bool {
+    let opt_log = logopt & (LOGOPT_DEBUG | LOGOPT_VERBOSE);
+    have_log_debug() || have_log_verbose() || opt_log != 0
 }
 
 /// `log_notice()`.
 pub fn log_notice(logopt: u32, msg: &[u8]) {
-    log_info(logopt, msg);
+    if verbose_or_debug(logopt) {
+        emit_pri(libc::LOG_NOTICE, msg);
+    }
 }
 
 /// `log_warn()`.
 pub fn log_warn(logopt: u32, msg: &[u8]) {
-    log_info(logopt, msg);
+    if verbose_or_debug(logopt) {
+        emit_pri(libc::LOG_WARNING, msg);
+    }
 }
 
 /// `log_error()`.
 pub fn log_error(_logopt: u32, msg: &[u8]) {
-    emit(msg);
+    emit_pri(libc::LOG_ERR, msg);
 }
 
 /// `log_crit()`.
 pub fn log_crit(_logopt: u32, msg: &[u8]) {
-    emit(msg);
+    emit_pri(libc::LOG_CRIT, msg);
 }
 
-/// `log_debug()`.
+/// `log_debug()` (syslog's priority for it is `LOG_WARNING`, as C has it).
 pub fn log_debug(logopt: u32, msg: &[u8]) {
     let opt_log = logopt & LOGOPT_DEBUG;
     if !have_log_debug() && opt_log == 0 {
         return;
     }
-    emit(msg);
+    emit_pri(libc::LOG_WARNING, msg);
 }
 
 /// `logmsg()`.
 pub fn logmsg(msg: &[u8]) {
-    emit(msg);
+    emit_pri(libc::LOG_CRIT, msg);
 }
 
 /// `open_log()`.

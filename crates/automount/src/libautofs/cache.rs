@@ -156,6 +156,29 @@ impl CacheInner {
         self.hash[h].iter().position(|me| me.key == b"*").map(|i| (h, i))
     }
 
+    /// `cache_clean_null_cache()`: empty the cache.
+    pub fn clean(&mut self) {
+        for chain in self.hash.iter_mut() {
+            chain.clear();
+        }
+    }
+
+    /// `cache_partial_match()`: the first entry (bucket by bucket) whose key is
+    /// `prefix/...`.
+    pub fn partial_match(&self, prefix: &[u8]) -> Option<Pos> {
+        let prefix = cstr::c(prefix);
+        let len = prefix.len();
+        for (b, chain) in self.hash.iter().enumerate() {
+            for (i, me) in chain.iter().enumerate() {
+                let k = cstr::c(&me.key);
+                if len < k.len() && k.starts_with(prefix) && k[len] == b'/' {
+                    return Some((b, i));
+                }
+            }
+        }
+        None
+    }
+
     /// `cache_partial_match_wild()`: the first entry (bucket by bucket) whose
     /// key is `prefix/*...`.
     pub fn partial_match_wild(&self, prefix: &[u8]) -> Option<Pos> {

@@ -225,3 +225,51 @@ pub fn spawn_umount(logopt: u32, args: &[&[u8]]) -> i32 {
 pub fn spawnv(logopt: u32, prog: &[u8], argv: &[Vec<u8>]) -> i32 {
     do_spawn(logopt, u32::MAX, SPAWN_OPT_NONE, prog, argv)
 }
+
+/// `spawn_bind_mount(logopt, args...)`: `mount --bind args...`.
+pub fn spawn_bind_mount(logopt: u32, args: &[&[u8]]) -> i32 {
+    let wait = defaults::defaults_get_mount_wait();
+    let options = SPAWN_OPT_OPEN;
+    let mut argc = args.len() + 2;
+    let no_mtab = mtab_is_proc();
+    if no_mtab {
+        debug!(logopt, "spawn_bind_mount", "mtab link detected, passing -n to mount");
+        argc += 1;
+    }
+    let mut argv: Vec<Vec<u8>> = vec![PATH_MOUNT.to_vec(), b"--bind".to_vec()];
+    if no_mtab {
+        argv.push(b"-n".to_vec());
+    }
+    argv.extend(args.iter().map(|a| a.to_vec()));
+    let mut ret = 0;
+    let mut printed = false;
+    for _ in 0..MTAB_LOCK_RETRIES {
+        ret = do_spawn(logopt, wait, options, PATH_MOUNT, &argv);
+        if ret == MTAB_NOTUPDATED {
+            if !printed {
+                debug!(logopt, "spawn_bind_mount", "mount failed with error code 16, retrying with the -f option");
+                printed = true;
+            }
+            // Move the last two arguments so do_spawn() finds the target.
+            if argv.len() <= argc {
+                let n = argv.len();
+                let last = argv[n - 1].clone();
+                let before = argv[n - 2].clone();
+                argv[n - 2] = b"-f".to_vec();
+                argv[n - 1] = before;
+                argv.push(last);
+            }
+            sys::sleep_secs(3);
+            continue;
+        }
+        break;
+    }
+    if ret == MTAB_NOTUPDATED {
+        warn!(logopt, "Unable to update the mtab file, forcing mount fail!");
+        if let Some(a) = argv.get(argc) {
+            sys::umount(a);
+        }
+        ret = MNT_FORCE_FAIL;
+    }
+    ret
+}

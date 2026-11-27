@@ -100,7 +100,10 @@ pub fn macro_init() {
     let endian: &[u8] = if cfg!(target_endian = "little") { b"little" } else { b"big" };
     {
         let mut g = GLOBAL.lock().unwrap();
-        g.table = system_table(&un, &processor, &host, &domain, &hostd, endian);
+        // Variables defined before (-D) stay in front of the system ones.
+        let mut t = std::mem::take(&mut g.table);
+        t.extend(system_table(&un, &processor, &host, &domain, &hostd, endian));
+        g.table = t;
     }
     add_std_amd_vars();
     GLOBAL.lock().unwrap().init_done = true;

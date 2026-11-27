@@ -1,0 +1,294 @@
+//! Differential tests: the daemon, on the root test VM (`make vmcheck`). See
+//! `tests/common/vm.rs`.
+
+mod common;
+
+use common::vm::{VmCase, check_vm};
+
+const NEEDS_VM: &str = "needs the root test VM (make vmcheck)";
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_indirect_basic() {
+    let _ = NEEDS_VM;
+    check_vm(
+        VmCase::new("d_indirect_basic", "/mnt/a /etc/autofs/auto.a\n")
+            .map("auto.a", "k -fstype=bind :/etc/autofs\nt -fstype=tmpfs :tmpfs\n")
+            .steps(
+                "ready\ntrig /mnt/a/k; waitlog 'mounted /mnt/a/k'\nsnap\n\
+                 trig /mnt/a/nope; waitlog 'failed to mount /mnt/a/nope'\n\
+                 trig /mnt/a/t; waitlog 'mounted /mnt/a/t'\nsnap\n",
+            ),
+    );
+}
+
+const MAP: &str = "k -fstype=bind :/etc/autofs\nt -fstype=tmpfs,size=1m :tmpfs\nro -ro,fstype=tmpfs :tmpfs\n\
+                   bad -fstype=nosuchfs :/dev/null\nnull -null\n* -fstype=tmpfs :tmpfs\n";
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_nobrowse() {
+    check_vm(VmCase::new("d_nobrowse", "/mnt/a /etc/autofs/auto.a -nobrowse\n").map("auto.a", MAP).steps(
+        "ready 'mounted indirect on'\nquiet 0.3\nsnap\nls /mnt/a >> $C/out/steps\n\
+             trig /mnt/a/t; waitlog 'mounted /mnt/a/t'\nsnap\nls /mnt/a >> $C/out/steps\n\
+             trig /mnt/a/bad; waitlog 'failed to mount /mnt/a/bad'\nls /mnt/a >> $C/out/steps\n\
+             trig /mnt/a/null; quiet 0.5\ntrig /mnt/a/wild; waitlog 'mounted /mnt/a/wild'\nsnap\n",
+    ));
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_browse_and_prune() {
+    check_vm(VmCase::new("d_prune", "/mnt/a /etc/autofs/auto.a --timeout=600\n").map("auto.a", MAP).steps(
+        "ready\nls /mnt/a >> $C/out/steps\ntrig /mnt/a/k; waitlog 'mounted /mnt/a/k'\n\
+         trig /mnt/a/ro; waitlog 'mounted /mnt/a/ro'\nsnap\n\
+         sig USR1; waitlog 'umounting /mnt/a/ro succeeded'; waitlog 'umounting /mnt/a/k succeeded'; quiet 1\nsnap\n\
+         ls /mnt/a >> $C/out/steps\n",
+    ));
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_negative_cache() {
+    check_vm(
+        VmCase::new("d_negative", "/mnt/a /etc/autofs/auto.a\n")
+            .map("auto.a", "k -fstype=tmpfs :tmpfs\nbad -fstype=nosuchfs :/dev/null\n")
+            .conf("[ autofs ]\nnegative_timeout = 60\n")
+            .steps(
+                "ready\ntrig /mnt/a/bad; waitlog 'failed to mount /mnt/a/bad'\nquiet 0.3\n\
+                 trig /mnt/a/bad; quiet 0.5\ntrig /mnt/a/nokey; waitlog 'failed to mount /mnt/a/nokey'\nquiet 0.3\n\
+                 trig /mnt/a/nokey; quiet 0.5\nsnap\n",
+            ),
+    );
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_two_mounts_and_null() {
+    check_vm(
+        VmCase::new(
+            "d_two",
+            "/mnt/a /etc/autofs/auto.a\n/mnt/b /etc/autofs/auto.b -ro\n/mnt/c -null\n/mnt/c /etc/autofs/auto.a\n",
+        )
+        .map("auto.a", "k -fstype=tmpfs :tmpfs\n")
+        .map("auto.b", "x -fstype=tmpfs :tmpfs\n")
+        .unordered_log()
+        .steps(
+            "waitlog 'mounted indirect on /mnt/b'; quiet 0.5\nsnap\ntrig /mnt/b/x; waitlog 'mounted /mnt/b/x'\n\
+             trig /mnt/a/k; waitlog 'mounted /mnt/a/k'\nsnap\n",
+        ),
+    );
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_hup_reload() {
+    check_vm(
+        VmCase::new("d_hup", "/mnt/a /etc/autofs/auto.a\n/mnt/b /etc/autofs/auto.a\n")
+            .map("auto.a", "k -fstype=tmpfs :tmpfs\ngone -fstype=tmpfs :tmpfs\n")
+            .unordered_log()
+            .steps(
+                "waitlog 'mounted indirect on /mnt/b'; quiet 0.5\ntrig /mnt/a/k; waitlog 'mounted /mnt/a/k'\nsnap\nquiet 2\n\
+                 printf 'k -fstype=tmpfs :tmpfs\\nnew -fstype=tmpfs :tmpfs\\n' > /etc/autofs/auto.a\n\
+                 printf '/mnt/a /etc/autofs/auto.a\\n/mnt/c /etc/autofs/auto.a\\n' > /etc/autofs/auto.master\n\
+                 touch -d '1 minute ago' /etc/autofs/auto.master\n\
+                 sig HUP; waitlog 'mounted indirect on /mnt/c'; waitlog 'shut down path /mnt/b'; quiet 1.5\nsnap\n\
+                 ls /mnt/a /mnt/c >> $C/out/steps\ntrig /mnt/a/new; waitlog 'mounted /mnt/a/new'\nsnap\n",
+            ),
+    );
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_busy_shutdown() {
+    check_vm(VmCase::new("d_busy", "/mnt/a /etc/autofs/auto.a\n").map("auto.a", MAP).steps(
+        "ready\ntrig /mnt/a/t; waitlog 'mounted /mnt/a/t'\n(cd /mnt/a/t && sleep 4) &\nquiet 0.5\n\
+         sig TERM; waitlog 'autofs stopped' 100 x; note busy\nsnap\nwait\n",
+    ));
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_forced_shutdown() {
+    check_vm(VmCase::new("d_force", "/mnt/a /etc/autofs/auto.a\n").map("auto.a", MAP).steps(
+        "ready\ntrig /mnt/a/t; waitlog 'mounted /mnt/a/t'\n(cd /mnt/a/t && sleep 3) &\nquiet 0.5\n\
+         sig USR2; waitlog 'autofs stopped' 100 x\nsnap\nwait\n",
+    ));
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_log_priority_fifo() {
+    check_vm(VmCase::new("d_fifo", "/mnt/a /etc/autofs/auto.a\n").map("auto.a", MAP).args(&["-f"]).steps(
+        "waitlog x 10 x; quiet 1\nls -l /run | grep fifo | cut -c1-10 >> $C/out/steps\n\
+         $AUTOMOUNT -l debug /mnt/a >> $C/out/steps 2>&1; note rc=$?\nquiet 0.5\n\
+         trig /mnt/a/t; quiet 1\n$AUTOMOUNT -l 3 /mnt/a >> $C/out/steps 2>&1; note rc=$?\nquiet 0.5\n\
+         trig /mnt/a/ro; quiet 1\n$AUTOMOUNT -l 9 /mnt/a >> $C/out/steps 2>&1; note rc=$?\n\
+         $AUTOMOUNT -l info /nonexistent >> $C/out/steps 2>&1; note rc=$?\n\
+         $AUTOMOUNT -l info >> $C/out/steps 2>&1; note rc=$?\n",
+    ));
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_already_running() {
+    check_vm(VmCase::new("d_running", "/mnt/a /etc/autofs/auto.a\n").map("auto.a", MAP).steps(
+        "ready\ncat /run/autofs-running | sed 's/[0-9]*/PID/' >> $C/out/steps\n\
+         $AUTOMOUNT -f /etc/autofs/auto.master >> $C/out/steps 2>&1; note rc=$?\n\
+         $AUTOMOUNT >> $C/out/steps 2>&1; note rc=$?\n",
+    ));
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_program_map() {
+    let prog = "#!/bin/sh\ncase \"$1\" in\nok) echo '-fstype=tmpfs :tmpfs' ;;\n\
+                env) echo \"-fstype=tmpfs,mode=0$AUTOFS_UID$AUTOFS_GID :tmpfs\" ;;\n*) exit 1 ;;\nesac\n";
+    check_vm(
+        VmCase::new("d_program", "/mnt/p /etc/autofs/auto.p\n")
+            .etc_mode("autofs/auto.p", prog, 0o755)
+            .steps(
+                "waitlog 'mounted indirect on'; quiet 0.3\ntrig /mnt/p/ok; waitlog 'mounted /mnt/p/ok'\n\
+                 trig /mnt/p/env; waitlog 'mounted /mnt/p/env'\ntrig /mnt/p/no; waitlog 'failed to mount /mnt/p/no'\nsnap\n",
+            ),
+    );
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_force_unlink() {
+    check_vm(
+        VmCase::new("d_force_unlink", "/mnt/a /etc/autofs/auto.a\n")
+            .map("auto.a", MAP)
+            .args(&["-f", "-d", "-F"])
+            .steps("ready\nsnap\n"),
+    );
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_pid_file_and_detach() {
+    check_vm(
+        VmCase::new("d_detach", "/mnt/a /etc/autofs/auto.a\n").map("auto.a", MAP).args(&["-p", "/run/am.pid"]).steps(
+            "quiet 1.5\nnote parent_gone=$(kill -0 $PID 2>/dev/null && echo no || echo yes)\n\
+             P=$(cat /run/am.pid); note pidfile=$( [ -n \"$P\" ] && echo yes)\nsnap\ntrig /mnt/a/t\nsnap\n\
+             kill -TERM $P; n=0; while kill -0 $P 2>/dev/null && [ $n -lt 100 ]; do n=$((n+1)); sleep 0.1; done\n\
+             note stopped=$(kill -0 $P 2>/dev/null && echo no || echo yes)\nls /run | grep -v fifo >> $C/out/steps\n",
+        ),
+    );
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_ioctl_fallback() {
+    // /dev/autofs answering nothing: the legacy ioctls on each mount.
+    check_vm(VmCase::new("d_legacy_ioctl", "/mnt/a /etc/autofs/auto.a\n").map("auto.a", MAP).pre("mount --bind /dev/null /dev/autofs\n").steps(
+        "ready\ntrig /mnt/a/t; waitlog 'mounted /mnt/a/t'\ntrig /mnt/a/nope; waitlog 'failed to mount /mnt/a/nope'\nsnap\n\
+         sig USR1; waitlog 'umounting /mnt/a/t succeeded'; quiet 0.5\nsnap\n",
+    ));
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_unlink_and_exit() {
+    check_vm(
+        VmCase::new("d_unlink_exit", "/mnt/a /etc/autofs/auto.a\n/mnt/b /etc/autofs/auto.a\n")
+            .map("auto.a", MAP)
+            .args(&["-d", "-U"])
+            .pre("mkdir -p /mnt/a/x /mnt/b; mount -t tmpfs tmpfs /mnt/a; mkdir /mnt/a/x; mount -t tmpfs tmpfs /mnt/a/x\n")
+            .steps("waitlog 'autofs stopped' 100 x\nsnap\n"),
+    );
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_no_master_map() {
+    check_vm(
+        VmCase::new("d_no_master", "-").args(&["-f", "-d", "-M", "3"]).steps("waitlog 'no mounts in table' 80\nsnap\n"),
+    );
+    check_vm(VmCase::new("d_empty_master", "# nothing\n").steps("waitlog 'no mounts in table' 50; quiet 0.5\n"));
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_options() {
+    check_vm(
+        VmCase::new("d_options", "/mnt/a /etc/autofs/auto.a\n")
+            .map("auto.a", "m -fstype=tmpfs,size=${SZ}k :tmpfs\nbad -fstype=nosuchfs :/dev/null\n")
+            .args(&["-f", "-d", "-O", "mode=0700", "-DSZ=256", "-n", "1", "-t", "1234", "-P", "5", "-r"])
+            .steps(
+                "ready\ntrig /mnt/a/m; waitlog 'mounted /mnt/a/m'\nsnap\ntrig /mnt/a/bad; waitlog 'failed to mount /mnt/a/bad'\n\
+                 quiet 2\ntrig /mnt/a/bad; waitlog 'failed to mount /mnt/a/bad' 50\nsnap\n",
+            ),
+    );
+}
+
+const EXPIRE_CYCLE: [&str; 7] = [
+    "st_expire: state",
+    "expire_proc: exp_proc",
+    "expire_proc_indirect: expire ",
+    "remaining in /mnt",
+    "expire_cleanup: got thid",
+    "expire_cleanup: sigchld",
+    "st_ready(): state = 2",
+];
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_timeout_expiry() {
+    check_vm(
+        VmCase::new("d_timeout", "/mnt/a /etc/autofs/auto.a --timeout=2\n")
+            .map("auto.a", MAP)
+            .drop_lines(&EXPIRE_CYCLE)
+            .steps(
+                "ready\ntrig /mnt/a/t; waitlog 'mounted /mnt/a/t'\ntrig /mnt/a/k; waitlog 'mounted /mnt/a/k'\nsnap\n\
+                 waitlog 'umounting /mnt/a/t succeeded' 100; waitlog 'umounting /mnt/a/k succeeded' 100; quiet 1.5\nsnap\n",
+            ),
+    );
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_symlinks() {
+    // Local paths as symlinks: the bind module's symlink option.
+    check_vm(
+        VmCase::new("d_symlinks", "/mnt/a /etc/autofs/auto.a\n/mnt/s /etc/autofs/auto.a -symlink\n")
+            .map("auto.a", "l -fstype=bind,symlink :/etc/autofs\ntc -fstype=bind,ro, :/etc\nb -fstype=bind :/etc/autofs\nself -fstype=bind :/mnt/a/self\n")
+            .unordered_log()
+            .steps(
+                "waitlog 'mounted indirect on /mnt/s'; quiet 0.5\ntrig /mnt/a/l/; waitlog 'mounted /mnt/a/l'\n\
+                 trig /mnt/a/tc/; waitlog 'mounted /mnt/a/tc'\ntrig /mnt/s/b/; waitlog 'mounted /mnt/s/b'\n\
+                 trig /mnt/a/self; waitlog 'failed to mount /mnt/a/self'\n\
+                 ls -l /mnt/a /mnt/s | sed 's/.* \\([^ ]* -> \\)/\\1/' >> $C/out/steps\nsnap\n\
+                 sig USR1; waitlog 'removing symlink /mnt/a/l'; quiet 1\nls /mnt/a /mnt/s >> $C/out/steps\n",
+            ),
+    );
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_amd_section() {
+    check_vm(
+        VmCase::new("d_amd", "/mnt/m /etc/autofs/amd.m\n")
+            .map("amd.m", "x type:=link;fs:=/etc/autofs\nt type:=program;fs:=/tmp/amdt;mount:=\"/bin/sh sh -c 'mkdir -p /tmp/amdt'\"\n")
+            .map("amd.n", "y type:=link;fs:=/etc\n")
+            .conf("[ amd ]\ndismount_interval = 600\n[ /mnt/m ]\nmap_type = file\n[ /mnt/n ]\nmap_name = /etc/autofs/amd.n\n")
+            .unordered_log()
+            .steps(
+                "waitlog 'mounted indirect on /mnt/n'; quiet 0.5\ntrig /mnt/m/x/; waitlog 'mounted /mnt/m/x'\n\
+                 trig /mnt/n/y/; waitlog 'mounted /mnt/n/y'\ntrig /mnt/m/t; waitlog '/mnt/m/t'; quiet 0.5\n\
+                 ls -l /mnt/m /mnt/n | sed 's/.* \\([^ ]* -> \\)/\\1/' >> $C/out/steps\nsnap\n",
+            ),
+    );
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_verbose_and_request_ids() {
+    check_vm(
+        VmCase::new("d_verbose", "/mnt/a /etc/autofs/auto.a\n")
+            .map("auto.a", MAP)
+            .conf("[ autofs ]\nmount_verbose = yes\nuse_mount_request_log_id = yes\n")
+            .steps("waitlog 'mounted indirect on'; quiet 0.3\ntrig /mnt/a/t; waitlog 'mounted /mnt/a/t'\ntrig /mnt/a/nope; quiet 1\n"),
+    );
+}

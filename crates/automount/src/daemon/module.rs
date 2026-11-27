@@ -237,8 +237,9 @@ pub fn open_mount(name: &[u8], err_prefix: Option<&[u8]>) -> Option<Box<dyn Moun
     match cstr::c(name) {
         b"nfs" | b"nfs4" => modules::mount_nfs::mount_init().map(|m| Box::new(m) as Box<dyn MountMod>),
         b"bind" => modules::mount_bind::mount_init().map(|m| Box::new(m) as Box<dyn MountMod>),
-        b"generic" | b"autofs" | b"ext2" | b"ext3" | b"ext4" | b"afs" | b"changer" => {
-            panic!("mount module {} isn't ported yet (phase 3)", String::from_utf8_lossy(name))
+        b"generic" => modules::mount_generic::mount_init().map(|m| Box::new(m) as Box<dyn MountMod>),
+        b"autofs" | b"ext2" | b"ext3" | b"ext4" | b"afs" | b"changer" => {
+            panic!("mount module {} isn't ported yet (phase 4)", String::from_utf8_lossy(name))
         }
         _ => {
             if let Some(p) = err_prefix {

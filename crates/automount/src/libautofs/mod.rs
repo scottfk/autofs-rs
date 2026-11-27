@@ -1,11 +1,14 @@
 //! autofs' `lib/`, what `libautofs.so` holds, plus the two parser skeletons.
 
+pub mod alarm;
 pub mod args;
 pub mod bison;
 pub mod cache;
 pub mod cat_path;
 pub mod cstr;
+pub mod csync;
 pub mod defaults;
+pub mod dev_ioctl;
 pub mod flex;
 pub mod log;
 pub mod macros;
