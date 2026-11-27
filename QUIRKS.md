@@ -112,6 +112,16 @@ The last section lists where the port can't or doesn't follow C, and why.
 | low | A program's words are split at every space, and a closing quote ends a word, so two spaces, or a space after a quoted word, make an empty argument. | `parse_subs::construct_argv` | `amd_program_mounts` (`quoted`) |
 | low | `rmdir_path()` unlinks a symbolic link that's the last component and still fails. | `automount::rmdir_path` | - |
 
+## The daemon (daemon/automount.c, daemon/state.c, daemon/indirect.c, daemon/flag.c, lib/mounts.c, modules/mount_bind.c)
+
+| Severity | Quirk | Where | Test |
+|---|---|---|---|
+| low | The command FIFO (`/run/autofs.cmd.fifo`) is removed by its own thread after `main()` asks it to stop, and `main()` exits without waiting, so the FIFO is usually left behind. | `automount::finish_cmd_pipe_handler` | every daemon case (left out of the comparison: it's a race) |
+| low | Bind mount options with an empty member (a trailing comma, `-fstype=bind,ro,`) make the entry a symlink: the empty option compares equal to `symlink` (`_strncmp()` with a length of 0). | `mount_bind::has_symlink_opt` | `daemon_symlinks` (`tc`) |
+| low | `umount_ent()` checks that a mount really went (and logs "the umount binary reported that ... was unmounted") only when `umount` *failed*. | `mounts::umount_ent_state` | - |
+| low | A flag file whose pid is only read on the last of three tries counts as stale (`while (tries--)` leaves 0 either way). | `flag::flag_is_owned` | - |
+| low | With several mounts, the order in which they shut down, reload or expire is a race between threads (and between `stderr` writes, which can run two messages together); C's own log order varies from run to run. | `state::st_queue_handler` | `daemon_two_mounts_and_null`, `daemon_hup_reload` (compared unordered) |
+
 ## Startup (daemon/automount.c, lib/mounts.c)
 
 | Severity | Quirk | Where | Test |
@@ -128,6 +138,8 @@ The last section lists where the port can't or doesn't follow C, and why.
 | The modules are built in: there are no `/usr/lib64/autofs/*.so` files or `libautofs.so`, and a map type without a module fails with the message `dlopen()` would give for the missing file. | Every module hydra has comes from autofs itself (see the README). |
 | `-Dname` without `=` is ignored. C's `macro_parse_globalvar()` walks off the end of its stack buffer looking for the `=`. | Undefined behavior; there's nothing to match. |
 | The master map scanner's 1024-byte `buff` grows instead of overrunning into the variables after it, and the scanner's own `master_error()` logs an empty line where C prints whatever a register held (`logmsg("%s")` without an argument; only for tokens over 2048 bytes). | Memory corruption and an uninitialized read; the hostile input phase looks at what the overrun does in the reference binary. |
-| `is_mounted()` reads the mount table instead of trying the `/dev/autofs` `ISMOUNTPOINT` ioctl first. | The ioctl needs `CAP_SYS_ADMIN`, so C falls back to the table without it too; the ioctl layer comes with the daemon (phase 3). |
 | Three amd error messages have a `%s` without an argument: "sublink option requires option fs" (two of them) and "mount type ... not valid as ufs mount type" print whatever a register held in C; the port prints the location's type there. | Undefined behavior. |
 | An amd program map answer shorter than its key is read from a model of the reused answer buffer (the last answer's bytes past its NUL). In C what's there depends on the heap; glibc hands back the chunk the last answer freed, which the model follows. | Reading past the end of a string. |
+| A busy expire or map read thread that's asked to cancel stops at the point C tests for a cancel (`pthread_testcancel()`) or between steps, not at any cancellation point (`read()`, `nanosleep()`...) inside. | Rust has no thread cancellation. |
+| An autofs point's pipe and ioctl descriptors start as 0: C `malloc()`s the structure and only sets them when it opens the pipe, so with `-U` they're whatever the memory held (0 on a fresh heap). | Uninitialized memory. |
+| A panic (a path not ported yet) aborts the daemon, rather than leaving the kernel waiting on a request thread that's gone. | Only for what isn't ported. |

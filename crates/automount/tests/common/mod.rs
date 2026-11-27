@@ -509,7 +509,7 @@ fn read(t: &Path, f: &str) -> String {
 
 /// `mkdtemp()` names (`/tmp/autoXXXXXX`) as `/tmp/auto@N@`, numbered in order
 /// of appearance.
-fn normalize_tmp(s: &str, names: &mut Vec<String>) -> String {
+pub fn normalize_tmp(s: &str, names: &mut Vec<String>) -> String {
     let mut out = String::new();
     let mut rest = s;
     while let Some(p) = rest.find("/tmp/auto") {
@@ -802,3 +802,5 @@ fn compare(name: &str, c: &Outcome, r: &Outcome) {
         panic!("{msg}");
     }
 }
+
+pub mod vm;
