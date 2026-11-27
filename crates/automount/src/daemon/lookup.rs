@@ -504,7 +504,7 @@ fn lookup_name_file_source_instance(ap: &Arc<AutofsPoint>, map: &Arc<MapSource>,
     let logopt = ap.logopt();
     let age = sys::monotonic_time();
     if name.first() == Some(&b'/') && map.lock().flags & MAP_FLAG_FORMAT_AMD != 0 {
-        panic!("amd host instance lookups aren't ported yet (phase 2)");
+        panic!("amd host instance lookups aren't ported yet (phase 5, with the hosts map)");
     }
     if map.argv().is_empty() {
         error!(logopt, "lookup_name_file_source_instance", "invalid arguments for autofs_point");
@@ -544,7 +544,7 @@ fn lookup_name_file_source_instance(ap: &Arc<AutofsPoint>, map: &Arc<MapSource>,
 fn lookup_name_source_instance(ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, ty: &[u8], name: &[u8]) -> i32 {
     let age = sys::monotonic_time();
     if name.first() == Some(&b'/') && map.lock().flags & MAP_FLAG_FORMAT_AMD != 0 {
-        panic!("amd host instance lookups aren't ported yet (phase 2)");
+        panic!("amd host instance lookups aren't ported yet (phase 5, with the hosts map)");
     }
     let format = map.format();
     let instance = match master::master_find_source_instance(map, Some(ty), format.as_deref(), None) {
@@ -579,7 +579,7 @@ fn do_name_lookup_mount(ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, name: &[u8]
         return NSS_STATUS_UNKNOWN;
     };
     if name.first() == Some(&b'/') && flags & MAP_FLAG_FORMAT_AMD != 0 {
-        panic!("amd host instance lookups aren't ported yet (phase 2)");
+        panic!("amd host instance lookups aren't ported yet (phase 5, with the hosts map)");
     }
     if !cstr::neq(&ty, b"file", 4) || a0.first() == Some(&b'/') {
         return do_lookup_mount(ap, map, name);

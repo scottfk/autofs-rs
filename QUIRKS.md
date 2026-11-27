@@ -23,7 +23,7 @@ The last section lists where the port can't or doesn't follow C, and why.
 
 | Severity | Quirk | Where | Test |
 |---|---|---|---|
-| medium | `uname()`'s result is tested the wrong way round, so when it works the amd defaults `arch`, `karch`, `os` and `osver` are set to nothing (and the `${arch}`-style macros built from them are missing). `autofs_use_lofs` gets `auto_dir`'s default (`/a`). | `ConfCache::load_amd_defaults` | (amd maps: phase 2) |
+| medium | `uname()`'s result is tested the wrong way round, so when it works the amd defaults `arch`, `karch`, `os` and `osver` are set to nothing (and the `${arch}`-style macros built from them are missing, so amd's `os==...`-style selectors fail with "failed to get selector"). `autofs_use_lofs` gets `auto_dir`'s default (`/a`). | `ConfCache::load_amd_defaults` | `amd_selectors`, `amd_expansion` |
 | medium | Lines that don't start with a letter or `[` are ignored, indented ones included: `  timeout = 5` does nothing. | `defaults::parse_line` | `dump_conf_indented` |
 | low | Lines are read 256 bytes at a time, so a longer line is parsed as several and the "was truncated, ignored" message can never appear. | `defaults::fgets_chunks` | - |
 | low | The "neither file has changed" test can never be true (`stat = fstat(...) != -1` assigns the comparison), so both files are reread every time the configuration is read. | `defaults_read_config` | - |
@@ -92,6 +92,26 @@ The last section lists where the port can't or doesn't follow C, and why.
 | low | `lookup_userhome.so` can't be selected: the master map's `userdir` type asks for `lookup_userdir.so`, which doesn't exist, and no nsswitch source or `multi` prefix names `userhome`. | `modules/lookup_userhome.rs` | - |
 | low | Closing the maps stops at the first one whose close fails (`rv = rv \|\| close_lookup()`); the rest stay open. | `LookupMulti::done` | - |
 
+## amd maps (modules/amd_tok.l, modules/amd_parse.y, modules/parse_amd.c, lib/parse_subs.c)
+
+| Severity | Quirk | Where | Test |
+|---|---|---|---|
+| medium | A selector value or option that isn't a word of two or more characters starting with a letter (`uid==0`, `addopts:=z`, a lone `${host}`) doesn't scan as one: flex's default rule logs its characters on lines of their own, and the selector compares with an empty value (or the option is dropped). | `amd_parse::State::lex` (rule 56) | `amd_selectors`, `amd_syntax` |
+| medium | `add_selector()` links a new selector in front of the list's last one, so a location keeps only its first and latest selectors; `match_selectors()` then evaluates the head (the latest) once per selector, and the first is never looked at. | `Parse::add_selector`, `parse_amd::match_selectors` | `amd_selectors` (`tri`, `two2`) |
+| medium | With `selectors_in_defaults`, a `-` location in `/defaults` copies a defaults entry that is still NULL: `SIGSEGV`. | `parse_amd::select_default_entry` | `amd_defaults_reset_crash` |
+| low | `sel!=` with no value is an equality test. | `Parse::action` (rule 21) | `amd_selectors` |
+| low | `cache:=` is tested the wrong way round (`strncmp()` without `!`): anything but `inc...` is `inc`, and `inc...` is `all`. | `Parse::match_cache_option` | (the cache option is used by the daemon, phase 3) |
+| low | A location with no file system type gets `nfs` by assignment, clearing its other flags (the `\|\|` cut, once it has been checked). | `parse_amd::update_with_defaults` | - |
+| low | `sublink` is never taken from the variables (it's looked up with a length of 2, `su`), and an expanded `umount` is added to them as `umoun`. | `update_with_defaults`, `expand_entry` | - |
+| low | Without `selectors_in_defaults`, a `/defaults` entry of more than one location is ignored in favor of the internal `opts:=rw,defaults`. | `parse_amd::select_default_entry` | `amd_defaults_selectors_off` |
+| low | `nfsl` links only when `${host}` and `${hostd}` both equal `rhost` (`strcasecmp() \|\| strcasecmp()`), so with a domain it always mounts over NFS. | `parse_amd::do_nfsl_mount` | `amd_nfsl_domain` |
+| low | An opts list, or one option, of 1024 bytes or more trips `_FORTIFY_SOURCE` in `prepend_opt()`; `merge_options()` resets its running length for most options (`resultlen =+ ...`), so a merged list over 256 bytes trips it too, as does a first list of 257 bytes or more. | `Parse::prepend_opt`, `parse_subs::merge_options` | `amd_long_opts_overflow`, `amd_merge_overflow` |
+| low | A file map that changed since it was read is searched again for each key, and a `prefix*` key matches without the `/` before the `*` (`ab*` matches `a/q`). | `LookupFile::match_key` | `amd_keys_reread` |
+| low | An amd program map's answer shorter than the key it should repeat is read past its end, into what the previous answer (the `/defaults` one) left in the buffer. | `lookup_program::skip_key` | `amd_program_map` (`short`) |
+| low | A network named in `/etc/networks` (`wire(loopback)`) has its number byte-swapped (`ntohl()` of a number already in host order) before it's looked up. | `parse_subs::get_network_number` | `amd_selectors` (`innet3`) |
+| low | A program's words are split at every space, and a closing quote ends a word, so two spaces, or a space after a quoted word, make an empty argument. | `parse_subs::construct_argv` | `amd_program_mounts` (`quoted`) |
+| low | `rmdir_path()` unlinks a symbolic link that's the last component and still fails. | `automount::rmdir_path` | - |
+
 ## Startup (daemon/automount.c, lib/mounts.c)
 
 | Severity | Quirk | Where | Test |
@@ -109,3 +129,5 @@ The last section lists where the port can't or doesn't follow C, and why.
 | `-Dname` without `=` is ignored. C's `macro_parse_globalvar()` walks off the end of its stack buffer looking for the `=`. | Undefined behavior; there's nothing to match. |
 | The master map scanner's 1024-byte `buff` grows instead of overrunning into the variables after it, and the scanner's own `master_error()` logs an empty line where C prints whatever a register held (`logmsg("%s")` without an argument; only for tokens over 2048 bytes). | Memory corruption and an uninitialized read; the hostile input phase looks at what the overrun does in the reference binary. |
 | `is_mounted()` reads the mount table instead of trying the `/dev/autofs` `ISMOUNTPOINT` ioctl first. | The ioctl needs `CAP_SYS_ADMIN`, so C falls back to the table without it too; the ioctl layer comes with the daemon (phase 3). |
+| Three amd error messages have a `%s` without an argument: "sublink option requires option fs" (two of them) and "mount type ... not valid as ufs mount type" print whatever a register held in C; the port prints the location's type there. | Undefined behavior. |
+| An amd program map answer shorter than its key is read from a model of the reused answer buffer (the last answer's bytes past its NUL). In C what's there depends on the heap; glibc hands back the chunk the last answer freed, which the model follows. | Reading past the end of a string. |

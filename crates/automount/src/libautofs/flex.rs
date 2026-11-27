@@ -149,6 +149,12 @@ impl Scanner {
         &self.ch_buf[self.text_ptr..self.text_ptr + self.leng]
     }
 
+    /// `yytext` read as C does outside a rule action: up to the first NUL from
+    /// where the last token (or the end-of-buffer match) started.
+    pub fn yytext_c(&self) -> &[u8] {
+        crate::libautofs::cstr::c(self.ch_buf.get(self.text_ptr..).unwrap_or(&[]))
+    }
+
     /// `yyleng`.
     pub fn yyleng(&self) -> usize {
         self.leng

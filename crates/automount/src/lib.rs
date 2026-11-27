@@ -49,6 +49,13 @@ macro_rules! error {
     };
 }
 
+/// `crit(opt, msg, ...)`: `log_crit()` with the function name in front.
+macro_rules! crit {
+    ($opt:expr, $func:literal, $fmt:literal $(, $arg:expr)* $(,)?) => {
+        $crate::libautofs::log::log_crit($opt, &bfmt!(concat!($func, ": ", $fmt) $(, $arg)*))
+    };
+}
+
 /// `logerr(msg, ...)`: `logmsg()` with the function name and the C source line.
 macro_rules! logerr {
     ($func:literal, $line:literal, $fmt:literal $(, $arg:expr)* $(,)?) => {

@@ -434,8 +434,8 @@ impl LookupFile {
 }
 
 impl LookupFile {
-    /// `match_key()`: an exact key match updates the cache (amd partial
-    /// matches come with the amd parser).
+    /// `match_key()`: an exact key match (or for amd maps a partial one)
+    /// updates the cache.
     fn match_key(&self, source: &Arc<MapSource>, map_key: &[u8], key: &[u8], mapent: &[u8]) -> i32 {
         let age = sys::monotonic_time();
         if cstr::eq(map_key, key) {
@@ -444,7 +444,21 @@ impl LookupFile {
         if source.lock().flags & MAP_FLAG_FORMAT_AMD == 0 {
             return CHE_FAIL;
         }
-        panic!("amd key matching isn't ported yet (phase 2)");
+        // A `prefix/*` map key for one of the key's parent paths.
+        // QUIRK: the `/` before the `*` isn't checked, so `ab*` matches `a/x`.
+        let map_key = cstr::c(map_key);
+        let mut lkp_key = cstr::c(key).to_vec();
+        if map_key.len() > lkp_key.len() + 2 {
+            return CHE_FAIL;
+        }
+        while let Some(prefix) = cstr::strrchr(&lkp_key, b'/') {
+            lkp_key.truncate(prefix);
+            let len = lkp_key.len();
+            if cstr::neq(map_key, &lkp_key, len) && map_key.get(len + 1) == Some(&b'*') {
+                return source.mc().lock().update(source.id, map_key, Some(mapent), age);
+            }
+        }
+        CHE_FAIL
     }
 
     /// `lookup_one()`: read the map file for `key`.
@@ -538,10 +552,12 @@ impl LookupFile {
         let mc = source.mc();
         {
             let mut c = mc.lock();
-            if source.lock().flags & MAP_FLAG_FORMAT_AMD != 0 {
-                panic!("amd key matching isn't ported yet (phase 2)");
-            }
-            if let Some(p) = c.lookup_distinct(key)
+            let exists = if source.lock().flags & MAP_FLAG_FORMAT_AMD != 0 {
+                parse_subs::match_cached_key(ap, source, &mut c, key)
+            } else {
+                c.lookup_distinct(key)
+            };
+            if let Some(p) = exists
                 && c.get(p).source == source.id
                 && ret & CHE_MISSING != 0
                 && c.get(p).mapent.is_some()
@@ -611,13 +627,20 @@ impl LookupFile {
             return NSS_STATUS_SUCCESS;
         }
         debug!(logopt, "lookup_mount", "lookup(file): looking up {}", name);
-        if flags & MAP_FLAG_FORMAT_AMD != 0 {
-            panic!("amd key lookups aren't ported yet (phase 2)");
-        }
-        let key = cstr::c(name).to_vec();
-        if key.len() > KEY_MAX_LEN {
-            return NSS_STATUS_NOTFOUND;
-        }
+        let key = if flags & MAP_FLAG_FORMAT_AMD == 0 {
+            let key = cstr::c(name).to_vec();
+            if key.len() > KEY_MAX_LEN {
+                return NSS_STATUS_NOTFOUND;
+            }
+            key
+        } else {
+            let key = parse_subs::expandamdent(name, &[]);
+            if key.len() > KEY_MAX_LEN {
+                return NSS_STATUS_NOTFOUND;
+            }
+            debug!(logopt, "lookup_mount", "lookup(file): expanded key: \"{}\"", key);
+            key
+        };
         // Check if we recorded a mount fail for this key anywhere.
         if let Some((mc2, p)) = lookup::lookup_source_mapent(ap, &key, true)
             && mc2.lock().lookup_negative(p, &key) == CHE_UNAVAIL

@@ -156,6 +156,22 @@ impl CacheInner {
         self.hash[h].iter().position(|me| me.key == b"*").map(|i| (h, i))
     }
 
+    /// `cache_partial_match_wild()`: the first entry (bucket by bucket) whose
+    /// key is `prefix/*...`.
+    pub fn partial_match_wild(&self, prefix: &[u8]) -> Option<Pos> {
+        let prefix = cstr::c(prefix);
+        let len = prefix.len();
+        for (b, chain) in self.hash.iter().enumerate() {
+            for (i, me) in chain.iter().enumerate() {
+                let k = cstr::c(&me.key);
+                if len < k.len() && k.starts_with(prefix) && k[len] == b'/' && k.get(len + 1) == Some(&b'*') {
+                    return Some((b, i));
+                }
+            }
+        }
+        None
+    }
+
     /// `cache_lookup_key_next()`: the next entry in the chain with the same key.
     pub fn lookup_key_next(&self, p: Pos) -> Option<Pos> {
         let me = self.get(p);

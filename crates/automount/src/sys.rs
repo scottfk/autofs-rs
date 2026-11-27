@@ -831,3 +831,195 @@ pub fn symlink(target: &[u8], link: &[u8]) -> i32 {
     // SAFETY: valid C strings.
     unsafe { libc::symlink(t.as_ptr(), l.as_ptr()) }
 }
+
+/// A socket address as `getaddrinfo()` and `getifaddrs()` give it: the family
+/// and the raw address bytes (4 for IPv4, 16 for IPv6; empty for others).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SockAddr {
+    pub family: c_int,
+    pub addr: Vec<u8>,
+    raw: Vec<u8>,
+}
+
+/// # Safety
+/// `sa` must be null or point to a socket address of its family's size.
+unsafe fn sockaddr_from(sa: *const libc::sockaddr) -> Option<SockAddr> {
+    if sa.is_null() {
+        return None;
+    }
+    // SAFETY: the caller's guarantee.
+    unsafe {
+        let family = (*sa).sa_family as c_int;
+        let (addr, len) = match family {
+            libc::AF_INET => {
+                let s = &*(sa as *const libc::sockaddr_in);
+                (s.sin_addr.s_addr.to_ne_bytes().to_vec(), std::mem::size_of::<libc::sockaddr_in>())
+            }
+            libc::AF_INET6 => {
+                let s = &*(sa as *const libc::sockaddr_in6);
+                (s.sin6_addr.s6_addr.to_vec(), std::mem::size_of::<libc::sockaddr_in6>())
+            }
+            _ => (Vec::new(), std::mem::size_of::<libc::sockaddr>()),
+        };
+        let raw = std::slice::from_raw_parts(sa as *const u8, len).to_vec();
+        Some(SockAddr { family, addr, raw })
+    }
+}
+
+/// One `getaddrinfo()` result.
+#[derive(Debug, Clone)]
+pub struct AddrInfo {
+    pub addr: SockAddr,
+    pub canonname: Option<Vec<u8>>,
+}
+
+/// `getaddrinfo(name, NULL, hints)`: the results, or the error code.
+pub fn getaddrinfo(name: &[u8], family: c_int, socktype: c_int, flags: c_int) -> Result<Vec<AddrInfo>, c_int> {
+    let n = cstring(name);
+    // SAFETY: zeroed addrinfo is valid hints.
+    let mut hints: libc::addrinfo = unsafe { std::mem::zeroed() };
+    hints.ai_family = family;
+    hints.ai_socktype = socktype;
+    hints.ai_flags = flags;
+    let mut res: *mut libc::addrinfo = std::ptr::null_mut();
+    // SAFETY: valid arguments; the list is copied, then freed.
+    unsafe {
+        let r = libc::getaddrinfo(n.as_ptr(), std::ptr::null(), &hints, &mut res);
+        if r != 0 {
+            return Err(r);
+        }
+        let mut out = Vec::new();
+        let mut p = res;
+        while !p.is_null() {
+            let canon = if (*p).ai_canonname.is_null() {
+                None
+            } else {
+                Some(CStr::from_ptr((*p).ai_canonname).to_bytes().to_vec())
+            };
+            if let Some(addr) = sockaddr_from((*p).ai_addr) {
+                out.push(AddrInfo { addr, canonname: canon });
+            }
+            p = (*p).ai_next;
+        }
+        libc::freeaddrinfo(res);
+        Ok(out)
+    }
+}
+
+/// `gai_strerror(code)`.
+pub fn gai_strerror(code: c_int) -> Vec<u8> {
+    // SAFETY: gai_strerror returns a static string.
+    unsafe { CStr::from_ptr(libc::gai_strerror(code)).to_bytes().to_vec() }
+}
+
+/// `getnameinfo(addr, host, NI_MAXHOST, NULL, 0, flags)`: the host, or the error code.
+pub fn getnameinfo(addr: &SockAddr, hostlen: usize, flags: c_int) -> Result<Vec<u8>, c_int> {
+    let mut host = vec![0 as c_char; hostlen];
+    // SAFETY: raw holds a complete socket address; host is hostlen bytes.
+    unsafe {
+        let r = libc::getnameinfo(
+            addr.raw.as_ptr() as *const libc::sockaddr,
+            addr.raw.len() as libc::socklen_t,
+            host.as_mut_ptr(),
+            hostlen as libc::socklen_t,
+            std::ptr::null_mut(),
+            0,
+            flags,
+        );
+        if r != 0 {
+            return Err(r);
+        }
+        Ok(CStr::from_ptr(host.as_ptr()).to_bytes().to_vec())
+    }
+}
+
+/// One `getifaddrs()` entry.
+#[derive(Debug, Clone)]
+pub struct IfAddr {
+    pub flags: u32,
+    pub addr: Option<SockAddr>,
+    pub netmask: Option<SockAddr>,
+}
+
+/// `getifaddrs()`: the entries, or `errno`.
+pub fn getifaddrs() -> Result<Vec<IfAddr>, i32> {
+    let mut ifa: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: the list is copied, then freed.
+    unsafe {
+        if libc::getifaddrs(&mut ifa) != 0 {
+            return Err(errno());
+        }
+        let mut out = Vec::new();
+        let mut p = ifa;
+        while !p.is_null() {
+            out.push(IfAddr {
+                flags: (*p).ifa_flags,
+                addr: sockaddr_from((*p).ifa_addr),
+                netmask: sockaddr_from((*p).ifa_netmask),
+            });
+            p = (*p).ifa_next;
+        }
+        libc::freeifaddrs(ifa);
+        Ok(out)
+    }
+}
+
+#[repr(C)]
+struct Netent {
+    n_name: *mut c_char,
+    n_aliases: *mut *mut c_char,
+    n_addrtype: c_int,
+    n_net: u32,
+}
+
+unsafe extern "C" {
+    fn getnetbyname(name: *const c_char) -> *mut Netent;
+    fn innetgr(netgroup: *const c_char, host: *const c_char, user: *const c_char, domain: *const c_char) -> c_int;
+}
+
+/// `getnetbyname(name)->n_net`, or `None`.
+pub fn getnetbyname_net(name: &[u8]) -> Option<u32> {
+    let n = cstring(name);
+    // SAFETY: n is a valid C string; the result is read before the next call.
+    unsafe {
+        let e = getnetbyname(n.as_ptr());
+        if e.is_null() { None } else { Some((*e).n_net) }
+    }
+}
+
+/// `innetgr(netgroup, host, NULL, NULL)`.
+pub fn innetgr_host(netgroup: &[u8], host: &[u8]) -> bool {
+    let (g, h) = (cstring(netgroup), cstring(host));
+    // SAFETY: valid C strings.
+    unsafe { innetgr(g.as_ptr(), h.as_ptr(), std::ptr::null(), std::ptr::null()) != 0 }
+}
+
+/// `statfs(path).f_type`, or `None`.
+pub fn statfs_type(path: &[u8]) -> Option<i64> {
+    let p = cstring(path);
+    // SAFETY: zeroed statfs is a valid out buffer.
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: valid arguments.
+    if unsafe { libc::statfs(p.as_ptr(), &mut fs) } != 0 {
+        return None;
+    }
+    Some(fs.f_type as i64)
+}
+
+/// `unlink(path)`.
+pub fn unlink(path: &[u8]) -> i32 {
+    let p = cstring(path);
+    // SAFETY: p is a valid C string.
+    unsafe { libc::unlink(p.as_ptr()) }
+}
+
+/// POSIX `dirname()` (libgen.h's), on a copy of `s`.
+pub fn xpg_dirname(s: &[u8]) -> Vec<u8> {
+    let mut c = cstring(s).into_bytes_with_nul();
+    // SAFETY: c is a NUL-terminated buffer dirname() may write into; the result
+    // points into it or to a static string, and is copied before c goes away.
+    unsafe {
+        let r = libc::dirname(c.as_mut_ptr() as *mut c_char);
+        CStr::from_ptr(r).to_bytes().to_vec()
+    }
+}

@@ -464,3 +464,65 @@ pub fn main() {
     let _ = (timeout, flags & DAEMON_FLAGS_FOREGROUND);
     panic!("the daemon isn't ported yet (phase 3)");
 }
+
+const AUTOFS_SUPER_MAGIC: i64 = 0x0187;
+const PATH_MAX: usize = 4096;
+
+/// `rmdir_path()`: remove as much of `path` as lies in the autofs file system
+/// on `dev`.
+///
+/// QUIRK: when the last component is a symbolic link it's unlinked, but the
+/// call still fails.
+pub fn rmdir_path(ap: &std::sync::Arc<master::AutofsPoint>, path: &[u8], dev: u64) -> i32 {
+    let logopt = ap.logopt();
+    let path = cstr::c(path);
+    if path.len() > PATH_MAX {
+        error!(logopt, "rmdir_path", "path longer than maximum length");
+        return -1;
+    }
+    let mut buf = path.to_vec();
+    let mut first = true;
+    loop {
+        let Some(st) = sys::lstat(&buf) else {
+            crit!(logopt, "rmdir_path", "lstat of {} failed", buf);
+            return -1;
+        };
+        if st.st_dev != dev {
+            return 0;
+        }
+        let Some(f_type) = sys::statfs_type(&buf) else {
+            error!(logopt, "rmdir_path", "could not stat fs of {}", buf);
+            return -1;
+        };
+        if f_type != AUTOFS_SUPER_MAGIC {
+            crit!(logopt, "rmdir_path", "attempt to remove directory from a non-autofs filesystem!");
+            crit!(logopt, "rmdir_path", "requester dev == {}, \"{}\" owner dev == {}", dev, buf, st.st_dev);
+            return -1;
+        }
+        if sys::rmdir(&buf) == -1 {
+            if first && sys::errno() == libc::ENOTDIR {
+                if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
+                    if sys::unlink(&buf) == -1 {
+                        return -1;
+                    }
+                } else {
+                    crit!(
+                        logopt,
+                        "rmdir_path",
+                        "file \"{}\" is neither a directory nor a symbolic link. mode {}",
+                        buf,
+                        st.st_mode
+                    );
+                    return -1;
+                }
+            }
+            return -1;
+        }
+        first = false;
+        match cstr::strrchr(&buf, b'/') {
+            Some(cp) if cp != 0 => buf.truncate(cp),
+            _ => break,
+        }
+    }
+    0
+}
