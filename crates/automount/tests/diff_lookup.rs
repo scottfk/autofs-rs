@@ -257,3 +257,10 @@ fn lookup_multi() {
         .etc_mode("autofs/auto.prog", b"#!/bin/sh\n[ \"$1\" = fromprog ] && echo s:/prog\n", 0o755),
     );
 }
+
+#[test]
+fn lookup_dequote_edges() {
+    // An option chunk of a backslash and a space: dequote()'s look-behind
+    // stops at index 1, not 0.
+    check_drv(many("lk_dequote", "", "escopt -\\  s:/x\ntrail \"s:/q\\\"\" \n", &["escopt", "trail"]));
+}

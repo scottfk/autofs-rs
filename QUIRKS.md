@@ -74,6 +74,15 @@ The last section lists where the port can't or doesn't follow C, and why.
 | low | `sanitize_path()` never removes a trailing `/` from a key (its test measures the string past its end). | `parse_subs::sanitize_path` | `dump_map_scanner` |
 | low | A line that starts with a blank after an entry continues it, but `read_one()` reads the continuation without keeping it; anything but blanks on it makes the whole entry a "bad map entry". | `lookup_file::read_one` | `dump_map_scanner` |
 
+## Key lookups (daemon/lookup.c, lib/mounts.c, modules/parse_sun.c, modules/lookup_program.c)
+
+| Severity | Quirk | Where | Test |
+|---|---|---|---|
+| medium | A request from a uid with no passwd entry keeps the previous request's user variables (`$USER`, `$HOME`, `$UID`...): `set_tsd_user_vars()` gives up without replacing them. | `mounts::set_tsd_user_vars` | `lookup_users` |
+| low | Colons after a `:/` become slashes in the expanded entry, including colons that came from macros (`$UID:$GID` in a location). | `parse_sun::expandsunent` | `lookup_users`, `lookup_sun_no_slashify` |
+| low | `sun_mount()` passes `nobrowse`, `browse` and `timeout=` on only for `fstype=autofs`, drops `bg` and `nofg` silently, and adds the map's `-D` macros to an autofs mount's options. | `ParseSun::sun_mount` | `lookup_sun_entries` |
+| low | A program map's child changes to the mount point directory before running the program; when that fails (the directory doesn't exist yet) its warning goes to the program's stderr and comes back as a `>> ` line. | `LookupProgram::lookup_one` | `lookup_program` |
+
 ## Multi maps (modules/lookup_multi.c)
 
 | Severity | Quirk | Where | Test |

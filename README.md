@@ -32,13 +32,13 @@ below), and so does this port.
 
 ## Status
 
-Phase 1 (groundwork, configuration, the master map and `--dumpmaps`) is done (PR #2):
-`automount -m` and `automount -m TYPE NAME` work for file, dir, program and `-hosts`
-maps in sun format, with the configuration, `nsswitch.conf`, master map includes and map
-includes, and match C byte for byte in 152 differential cases (stdout, stderr, exit
-status and every `mount`/`umount` command), crashes included. Starting the daemon stops
-after the kernel protocol check (which needs root on the test VM). Next: phase 2 (maps
-and lookups).
+Phases 1 and 2 are done (phase 2 in PR #3): `--dumpmaps` works for every map type
+hydra's build has (file, dir, program, `multi`, `-hosts`, amd maps; NIS+ fails as it does
+on hydra), and keys are looked up as the daemon looks them up (file, program and `multi`
+maps, the sun parser for plain entries, includes, nsswitch sources, the negative cache,
+browse directories), all matching C byte for byte in nearly 200 differential cases. The
+lookups are tested through a driver that runs the reference daemon's own code, with
+recording mount modules. Next: phase 2b (amd maps), then phase 3 (the daemon).
 
 The plan and its status live in the [roadmap](#roadmap) below, which is updated as each
 step lands.
@@ -129,14 +129,18 @@ comes in two tiers:
    `-null`); `automount`'s option handling, `-V`, `--help`, the root check and the kernel
    protocol check; and `-m`/`--dumpmaps` for file, dir, program and `-hosts` maps in sun
    format, with the module setup it does (the bind mount check through `spawn.c`).
-2. **Maps and lookups (planned):** the `tirpc` dependency; `parse_sun` in full
-   (multi-mounts and offsets, replicated locations, `-fstype=`, option merging, `&` and
-   `*` keys, escapes);
-   `parse_amd` with the amd grammar, selectors and macros; `lookup_file`, `lookup_dir`,
-   `lookup_multi`, `lookup_program` (its environment, stdout/stderr handling and
-   timeout), `lookup_userhome`, `lookup_hosts` (exports through `MOUNTPROC_EXPORT`),
-   `lookup_yp` and `lookup_nisplus`; `--dumpmaps` for every map type (`multi`, amd), and
-   the module driver for lookups.
+2. **Maps and lookups (done, PR #3):** `--dumpmaps` for every map type (`multi`, amd,
+   `-hosts`, NIS+); `lookup_nss_mount()` and the negative cache; key lookups in
+   `lookup_file`, `lookup_program` (its environment, stdout/stderr handling),
+   `lookup_multi` and `lookup_userhome`; `parse_sun` for plain entries (`&` and `$`
+   expansion, option merging, replicated locations, `-fstype=`, `[no]strict`,
+   `[no-]use-weight-only`, escapes); `lookup_ghost()`; and the test drivers.
+   Moved out: multi-mount entries to phase 4 (hydra's `/net` program map answers with
+   one, and so does every `-hosts` lookup), `-hosts` export lists and NIS to phase 5 (they
+   need the RPC client, and hydra uses neither).
+2b. **amd maps (planned):** `parse_amd` with the amd grammar, selectors and macros,
+   amd key matching (`/defaults`, wildcard prefixes) in the file and program maps, and
+   amd mount types, through the same drivers.
 3. **The daemon, indirect mounts (planned):** startup (the pid file, daemonizing, the
    running check, `-F`/`-U`, `-f`, `-t`, `-n`/`-P`, `-M`, `-O`, `-D`, `-r`), the master
    map at boot, `/dev/autofs` and the ioctl fallback, `-l`/`--set-log-priority` and the
@@ -150,7 +154,9 @@ comes in two tiers:
    `mount_ext2` (with its `fsck` run), `mount_afs`, `mount_changer`, map reloads that add,
    change or remove entries while mounts are in use, and restart over existing mounts
    (`README.active-restart`).
-5. **NFS (planned):** `mount_nfs` and `replicated.c` (proximity, version and protocol
+5. **NFS and RPC maps (planned):** the `tirpc` dependency; `-hosts` export lists
+   (`MOUNTPROC_EXPORT`); `lookup_yp` (the YP client calls on `tirpc`, against fake
+   `ypbind` and `ypserv`); `mount_nfs` and `replicated.c` (proximity, version and protocol
    probing with `NULL` pings and portmap lookups, weights, `-r` random selection,
    `mount_nfs_default_protocol`, `nfs_mount_uses_string_options`, fallback when a
    server doesn't answer), against fake servers in the probe and then against
