@@ -1249,13 +1249,7 @@ fn setup_defaults(ap: &Arc<AutofsPoint>, name: &[u8], source: &Arc<MapSource>) -
 
 impl ParseAmd {
     /// `parse_mount()`.
-    fn mount_impl(
-        &mut self,
-        ap: &Arc<AutofsPoint>,
-        source: &Arc<MapSource>,
-        name: &[u8],
-        mapent: Option<&[u8]>,
-    ) -> i32 {
+    fn mount_impl(&self, ap: &Arc<AutofsPoint>, source: &Arc<MapSource>, name: &[u8], mapent: Option<&[u8]>) -> i32 {
         let logopt = ap.logopt();
         let flags = defaults::conf_amd_get_flags(Some(&ap.path())) & 0xffff_ffff;
         let Some(mapent) = mapent else {
@@ -1333,15 +1327,15 @@ impl ParseAmd {
 }
 
 impl ParseMod for ParseAmd {
-    fn reinit(&mut self, _argv: &Argv) -> i32 {
+    fn reinit(&self, _argv: &Argv) -> i32 {
         0
     }
 
-    fn mount(&mut self, ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, name: &[u8], mapent: Option<&[u8]>) -> i32 {
+    fn mount(&self, ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, name: &[u8], mapent: Option<&[u8]>) -> i32 {
         self.mount_impl(ap, map, name, mapent)
     }
 
-    fn done(self: Box<Self>) -> i32 {
+    fn done(&self) -> i32 {
         let m = {
             let mut g = NFS.lock().unwrap();
             g.1 = g.1.wrapping_sub(1);

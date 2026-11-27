@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use crate::daemon::master::{AutofsPoint, LKP_DIRECT, MOUNT_FLAG_GHOST, MapSource, Master};
-use crate::daemon::module::{self, LookupMod, ParseMod};
+use crate::daemon::module::{self, LookupMod};
 use crate::libautofs::args::Argv;
 use crate::libautofs::nsswitch::{NSS_STATUS_SUCCESS, NSS_STATUS_UNKNOWN};
 use crate::sys;
@@ -15,13 +15,13 @@ const MODPREFIX: &[u8] = b"lookup(hosts): ";
 
 #[derive(Debug)]
 pub struct LookupHosts {
-    parse: Option<Box<dyn ParseMod>>,
+    parse: std::sync::Mutex<Option<module::Parse>>,
 }
 
 /// `lookup_init()`.
 pub fn lookup_init(_mapfmt: Option<&[u8]>, argv: &Argv) -> Option<LookupHosts> {
     match module::open_parse(b"sun", Some(MODPREFIX), argv) {
-        Some(p) => Some(LookupHosts { parse: Some(p) }),
+        Some(p) => Some(LookupHosts { parse: std::sync::Mutex::new(Some(p)) }),
         None => {
             logerr!("lookup_init", "57", "lookup(hosts): failed to open parse context");
             None
@@ -30,20 +30,20 @@ pub fn lookup_init(_mapfmt: Option<&[u8]>, argv: &Argv) -> Option<LookupHosts> {
 }
 
 impl LookupMod for LookupHosts {
-    fn reinit(&mut self, _mapfmt: Option<&[u8]>, argv: &Argv) -> i32 {
-        let p = self.parse.as_mut().expect("parse context");
-        if module::reinit_parse(p.as_mut(), b"sun", Some(MODPREFIX), argv) != 0 {
+    fn reinit(&self, _mapfmt: Option<&[u8]>, argv: &Argv) -> i32 {
+        let p = self.parse.lock().unwrap().clone().expect("parse context");
+        if module::reinit_parse(&*p, b"sun", Some(MODPREFIX), argv) != 0 {
             return 1;
         }
         0
     }
 
-    fn read_master(&mut self, _master: &Arc<Master>, _age: i64) -> i32 {
+    fn read_master(&self, _master: &Arc<Master>, _age: i64) -> i32 {
         NSS_STATUS_UNKNOWN
     }
 
     /// `lookup_read_map()`.
-    fn read_map(&mut self, ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, age: i64) -> i32 {
+    fn read_map(&self, ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, age: i64) -> i32 {
         let source = map;
         let mc = source.mc();
         let logopt = ap.logopt();
@@ -66,7 +66,7 @@ impl LookupMod for LookupHosts {
         NSS_STATUS_SUCCESS
     }
 
-    fn done(self: Box<Self>) -> i32 {
-        self.parse.map_or(0, module::close_parse)
+    fn done(&self) -> i32 {
+        self.parse.lock().unwrap().take().map_or(0, module::close_parse)
     }
 }

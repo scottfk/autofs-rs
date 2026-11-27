@@ -7,12 +7,13 @@
 //! The scanner works on the file one `getc()` at a time, as C does, with
 //! `ungetc()` and the end-of-file flag kept the same way.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::daemon::lookup;
 use crate::daemon::master::{self, AutofsPoint, MAP_FLAG_FORMAT_AMD, MapSource, Master};
 use crate::daemon::master_parse;
-use crate::daemon::module::{self, LookupMod, ParseMod};
+use crate::daemon::module::{self, LookupMod};
 use crate::libautofs::args::{self, Argv};
 use crate::libautofs::cache::{CHE_COMPLETED, CHE_FAIL, CHE_MISSING, CHE_OK, CHE_UNAVAIL, CHE_UPDATED};
 use crate::libautofs::cstr;
@@ -31,17 +32,32 @@ const EOF: i32 = -1;
 
 #[derive(Debug)]
 pub struct LookupFile {
-    pub mapname: Vec<u8>,
-    pub opts_argv: Argv,
-    pub last_read: i64,
-    pub parse: Option<Box<dyn ParseMod>>,
+    mapname: Mutex<Vec<u8>>,
+    opts_argv: Mutex<Argv>,
+    last_read: AtomicI64,
+    parse: Mutex<Option<module::Parse>>,
+}
+
+impl LookupFile {
+    fn mapname(&self) -> Vec<u8> {
+        self.mapname.lock().unwrap().clone()
+    }
+
+    fn opts_argv(&self) -> Argv {
+        self.opts_argv.lock().unwrap().clone()
+    }
+
+    /// The parse context (shared: the lock isn't held while it's used).
+    fn parse(&self) -> module::Parse {
+        self.parse.lock().unwrap().clone().expect("parse context")
+    }
 }
 
 /// `do_init()`.
 fn do_init(
     mapfmt: Option<&[u8]>,
     argv: &Argv,
-    parse: &mut Option<Box<dyn ParseMod>>,
+    parse: &mut Option<module::Parse>,
     reinit: bool,
 ) -> Option<(Vec<u8>, Argv)> {
     if argv.is_empty() {
@@ -60,8 +76,8 @@ fn do_init(
     let mapfmt = mapfmt.unwrap_or(b"sun");
     let opts: Argv = argv[1..].to_vec();
     if reinit {
-        let p = parse.as_mut().expect("parse context");
-        if module::reinit_parse(p.as_mut(), mapfmt, Some(MODPREFIX), &opts) != 0 {
+        let p = parse.as_ref().expect("parse context");
+        if module::reinit_parse(&**p, mapfmt, Some(MODPREFIX), &opts) != 0 {
             logmsg!("lookup(file): failed to reinit parse context");
             return None;
         }
@@ -81,7 +97,12 @@ fn do_init(
 pub fn lookup_init(mapfmt: Option<&[u8]>, argv: &Argv) -> Option<LookupFile> {
     let mut parse = None;
     let (mapname, opts_argv) = do_init(mapfmt, argv, &mut parse, false)?;
-    Some(LookupFile { mapname, opts_argv, last_read: 0, parse })
+    Some(LookupFile {
+        mapname: Mutex::new(mapname),
+        opts_argv: Mutex::new(opts_argv),
+        last_read: AtomicI64::new(0),
+        parse: Mutex::new(parse),
+    })
 }
 
 /// A stdio stream over a file's contents: `getc()`, `ungetc()` and `feof()`.
@@ -406,7 +427,7 @@ impl LookupFile {
             return None;
         };
         let mut argv: Argv = vec![info.map.clone()];
-        argv.extend(self.opts_argv.iter().cloned());
+        argv.extend(self.opts_argv());
         let new = match master::master_find_source_instance(
             source,
             info.ty.as_deref(),
@@ -466,10 +487,10 @@ impl LookupFile {
         let logopt = ap.logopt();
         let age = sys::monotonic_time();
         let mc = source.mc();
-        let mut f = match open_map(&self.mapname) {
+        let mut f = match open_map(&self.mapname()) {
             Ok(f) => f,
             Err(_) => {
-                error!(logopt, "lookup_one", "lookup(file): could not open map file {}", self.mapname);
+                error!(logopt, "lookup_one", "lookup(file): could not open map file {}", self.mapname());
                 return CHE_FAIL;
             }
         };
@@ -478,7 +499,7 @@ impl LookupFile {
                 if mkey.first() == Some(&b'+') {
                     let ck = cstr::c(&mkey).to_vec();
                     debug!(logopt, "lookup_one", "lookup(file): lookup included map {}", ck);
-                    let inc = check_self_include(&ck, &self.mapname);
+                    let inc = check_self_include(&ck, &self.mapname());
                     let Some(inc_source) = self.prepare_plus_include(ap, source, age, &ck, inc) else {
                         debug!(logopt, "lookup_one", "lookup(file): failed to select included map {}", key);
                         continue;
@@ -520,10 +541,10 @@ impl LookupFile {
     fn lookup_wild(&self, ap: &Arc<AutofsPoint>, source: &Arc<MapSource>) -> i32 {
         let logopt = ap.logopt();
         let age = sys::monotonic_time();
-        let mut f = match open_map(&self.mapname) {
+        let mut f = match open_map(&self.mapname()) {
             Ok(f) => f,
             Err(_) => {
-                error!(logopt, "lookup_wild", "lookup(file): could not open map file {}", self.mapname);
+                error!(logopt, "lookup_wild", "lookup(file): could not open map file {}", self.mapname());
                 return CHE_FAIL;
             }
         };
@@ -591,12 +612,12 @@ impl LookupFile {
     /// `map_update_needed()`: 1 to read the map, 0 not to, -1 if it can't be
     /// stat()ed.
     fn map_update_needed(&self, ap: &Arc<AutofsPoint>, source: &Arc<MapSource>) -> i32 {
-        let Some(st) = sys::stat(&self.mapname) else {
-            error!(ap.logopt(), "map_update_needed", "lookup(file): file map {}, could not stat", self.mapname);
+        let Some(st) = sys::stat(&self.mapname()) else {
+            error!(ap.logopt(), "map_update_needed", "lookup(file): file map {}, could not stat", self.mapname());
             return -1;
         };
         let mut s = source.lock();
-        if st.st_mtime <= self.last_read {
+        if st.st_mtime <= self.last_read.load(Ordering::Relaxed) {
             if s.instances.is_empty() && s.ty.as_deref().is_some_and(|t| !cstr::eq(t, b"multi")) {
                 return 0;
             }
@@ -611,7 +632,7 @@ const NSS_STATUS_COMPLETED: i32 = 4;
 
 impl LookupFile {
     /// `lookup_mount()`.
-    fn mount_impl(&mut self, ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, name: &[u8]) -> i32 {
+    fn mount_impl(&self, ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, name: &[u8]) -> i32 {
         let source = map;
         let mc = source.mc();
         let logopt = ap.logopt();
@@ -623,7 +644,7 @@ impl LookupFile {
             return NSS_STATUS_UNAVAIL;
         }
         if depth > MAX_INCLUDE_DEPTH {
-            error!(logopt, "lookup_mount", "lookup(file): maximum include depth exceeded {}", self.mapname);
+            error!(logopt, "lookup_mount", "lookup(file): maximum include depth exceeded {}", self.mapname());
             return NSS_STATUS_SUCCESS;
         }
         debug!(logopt, "lookup_mount", "lookup(file): looking up {}", name);
@@ -700,9 +721,7 @@ impl LookupFile {
         }
         let Some(mapent) = mapent else { return NSS_STATUS_TRYAGAIN };
         debug!(logopt, "lookup_mount", "lookup(file): {} -> {}", lkp_key, mapent);
-        let mut parse = self.parse.take().expect("parse context");
-        let ret = parse.mount(ap, source, &key, Some(&mapent));
-        self.parse = Some(parse);
+        let ret = self.parse().mount(ap, source, &key, Some(&mapent));
         if ret != 0 {
             if ap.lock().flags & master::MOUNT_FLAG_REMOUNT != 0 {
                 return NSS_STATUS_TRYAGAIN;
@@ -717,12 +736,15 @@ impl LookupFile {
 
 impl LookupMod for LookupFile {
     /// `lookup_reinit()`.
-    fn reinit(&mut self, mapfmt: Option<&[u8]>, argv: &Argv) -> i32 {
-        match do_init(mapfmt, argv, &mut self.parse, true) {
+    fn reinit(&self, mapfmt: Option<&[u8]>, argv: &Argv) -> i32 {
+        let mut parse = self.parse.lock().unwrap().clone();
+        let r = do_init(mapfmt, argv, &mut parse, true);
+        *self.parse.lock().unwrap() = parse;
+        match r {
             Some((m, o)) => {
-                self.mapname = m;
-                self.opts_argv = o;
-                self.last_read = 0;
+                *self.mapname.lock().unwrap() = m;
+                *self.opts_argv.lock().unwrap() = o;
+                self.last_read.store(0, Ordering::Relaxed);
                 0
             }
             None => 1,
@@ -730,7 +752,7 @@ impl LookupMod for LookupFile {
     }
 
     /// `lookup_read_master()`.
-    fn read_master(&mut self, master: &Arc<Master>, age: i64) -> i32 {
+    fn read_master(&self, master: &Arc<Master>, age: i64) -> i32 {
         let (recurse, depth, timeout, logging, logopt) = {
             let m = master.lock();
             (m.recurse, m.depth, m.default_timeout, m.default_logging, m.logopt)
@@ -742,13 +764,13 @@ impl LookupMod for LookupFile {
             error!(logopt, "lookup_read_master", "lookup(file): maximum include depth exceeded {}", master.name());
             return NSS_STATUS_UNKNOWN;
         }
-        let mut f = match open_map(&self.mapname) {
+        let mut f = match open_map(&self.mapname()) {
             Ok(f) => f,
             Err(e) => {
                 if e == libc::ENOENT {
                     return NSS_STATUS_NOTFOUND;
                 }
-                error!(logopt, "lookup_read_master", "lookup(file): could not open master map file {}", self.mapname);
+                error!(logopt, "lookup_read_master", "lookup(file): could not open master map file {}", self.mapname());
                 return NSS_STATUS_UNKNOWN;
             }
         };
@@ -763,7 +785,7 @@ impl LookupMod for LookupFile {
             if path.first() == Some(&b'+') {
                 let save = master.name();
                 master.set_name(cstr::c(&path[1..]).to_vec());
-                let inc = check_master_self_include(&master.name(), &self.mapname);
+                let inc = check_master_self_include(&master.name(), &self.mapname());
                 {
                     let mut m = master.lock();
                     if inc {
@@ -798,7 +820,7 @@ impl LookupMod for LookupFile {
     }
 
     /// `lookup_read_map()`.
-    fn read_map(&mut self, ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, age: i64) -> i32 {
+    fn read_map(&self, ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, age: i64) -> i32 {
         let source = map;
         let mc = source.mc();
         let logopt = ap.logopt();
@@ -810,16 +832,16 @@ impl LookupMod for LookupFile {
             return NSS_STATUS_TRYAGAIN;
         }
         if depth > MAX_INCLUDE_DEPTH {
-            error!(logopt, "lookup_read_map", "maximum include depth exceeded {}", self.mapname);
+            error!(logopt, "lookup_read_map", "maximum include depth exceeded {}", self.mapname());
             return NSS_STATUS_UNKNOWN;
         }
-        let mut f = match open_map(&self.mapname) {
+        let mut f = match open_map(&self.mapname()) {
             Ok(f) => f,
             Err(e) => {
                 if e == libc::ENOENT {
                     return NSS_STATUS_NOTFOUND;
                 }
-                error!(logopt, "lookup_read_map", "lookup(file): could not open map file {}", self.mapname);
+                error!(logopt, "lookup_read_map", "lookup(file): could not open map file {}", self.mapname());
                 return NSS_STATUS_UNKNOWN;
             }
         };
@@ -833,7 +855,7 @@ impl LookupMod for LookupFile {
             if key.first() == Some(&b'+') {
                 let ck = cstr::c(&key).to_vec();
                 debug!(logopt, "lookup_read_map", "read included map {}", ck);
-                let inc = check_self_include(&ck, &self.mapname);
+                let inc = check_self_include(&ck, &self.mapname());
                 let Some(inc_source) = self.prepare_plus_include(ap, source, age, &ck, inc) else {
                     debug!(logopt, "lookup_read_map", "failed to select included map {}", ck);
                     continue;
@@ -859,16 +881,16 @@ impl LookupMod for LookupFile {
             }
         }
         source.lock().age = age;
-        self.last_read = sys::time();
+        self.last_read.store(sys::time(), Ordering::Relaxed);
         NSS_STATUS_SUCCESS
     }
 
-    fn mount(&mut self, ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, name: &[u8]) -> i32 {
+    fn mount(&self, ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, name: &[u8]) -> i32 {
         LookupFile::mount_impl(self, ap, map, name)
     }
 
     /// `lookup_done()`.
-    fn done(self: Box<Self>) -> i32 {
-        self.parse.map_or(0, module::close_parse)
+    fn done(&self) -> i32 {
+        self.parse.lock().unwrap().take().map_or(0, module::close_parse)
     }
 }

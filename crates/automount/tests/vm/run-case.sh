@@ -1,6 +1,7 @@
 #!/bin/sh
 # 20261127 - Created by Claude (claude.ai, Anthropic) - scottfk
 # 20261127 - Time-limit the final tree listing so a dead daemon cannot hang a run - Claude - scottfk
+# 20261127 - Add restartd: kill the daemon with SIGKILL and start it again over its mounts - Claude - scottfk
 #
 # run-case.sh - run one daemon case on the root test VM (see tests/common/vm.rs)
 #
@@ -76,6 +77,7 @@ ready() { waitlog "${1:-ghosting enabled}" 100; }
 sig() { kill -"$1" $PID; }
 trig() { timeout 20 ls "$1" >/dev/null 2>&1; note "trig $1: $?"; }
 quiet() { sleep "${1:-1}"; }
+restartd() { kill -KILL $PID; wait $PID 2>/dev/null; note "restarted"; set --; [ -f "$C/args" ] && while IFS= read -r a; do set -- "$@" "$a"; done < "$C/args"; setsid "$AUTOMOUNT" "$@" >> "$C/out/log" 2>&1 & PID=$!; }
 stopd() { kill -TERM $PID 2>/dev/null || true; n=0; while kill -0 $PID 2>/dev/null; do n=$((n+1)); [ $n -gt 300 ] && { note "daemon did not stop"; kill -KILL $PID; break; }; sleep 0.1; done; }
 : > "$C/out/steps"
 set +e

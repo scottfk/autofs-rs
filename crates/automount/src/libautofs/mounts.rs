@@ -515,6 +515,8 @@ pub struct MntList {
     pub mount_seq: u64,
     /// The submount it is (`MNTS_AUTOFS`).
     pub sub_ap: Option<std::sync::Weak<crate::daemon::master::AutofsPoint>>,
+    /// When it went on its parent's `submounts` list (0: not on it).
+    pub sub_seq: u64,
 }
 
 static MOUNT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -570,6 +572,14 @@ pub fn mnts_remove_amdmount(mp: &[u8]) {
     m.amd_opts = None;
     m.amd_cache_opts = 0;
     mnts_put_mount(&mut g, i);
+}
+
+/// For a new amd submount: its amd mount's `pref` (taken: `mnt->amd_pref =
+/// NULL`) and cache options.
+pub fn mnts_take_amd_pref(path: &[u8]) -> Option<(Option<Vec<u8>>, u32)> {
+    let mut g = MNTS.lock().unwrap();
+    let m = g.iter_mut().find(|m| cstr::eq(&m.mp, path) && m.refs != 0 && m.flags & MNTS_AMD_MOUNT != 0)?;
+    Some((m.amd_pref.take(), m.amd_cache_opts))
 }
 
 /// `mnts_find_amdmount()`.
@@ -661,20 +671,69 @@ pub fn mnts_remove_submount(mp: &[u8]) {
     {
         g[i].flags &= !MNTS_AUTOFS;
         g[i].sub_ap = None;
+        g[i].sub_seq = 0;
         mnts_put_mount(&mut g, i);
     }
 }
 
-/// The submounts whose parent is `ap` (`ap->submounts`).
+/// The submounts whose parent is `ap` (`ap->submounts`), in list order.
 pub fn mnts_submounts_of(
     ap: &crate::daemon::master::AutofsPoint,
 ) -> Vec<std::sync::Arc<crate::daemon::master::AutofsPoint>> {
     let g = MNTS.lock().unwrap();
-    g.iter()
-        .filter(|m| m.flags & MNTS_AUTOFS != 0)
-        .filter_map(|m| m.sub_ap.as_ref().and_then(|w| w.upgrade()))
-        .filter(|s| s.parent.as_ref().is_some_and(|p| p.id == ap.id))
-        .collect()
+    let mut v: Vec<(u64, std::sync::Arc<crate::daemon::master::AutofsPoint>)> = g
+        .iter()
+        .filter(|m| m.sub_seq != 0)
+        .filter_map(|m| m.sub_ap.as_ref().and_then(|w| w.upgrade()).map(|s| (m.sub_seq, s)))
+        .filter(|(_, s)| s.parent.as_ref().is_some_and(|p| p.id == ap.id))
+        .collect();
+    v.sort_by_key(|(q, _)| *q);
+    v.into_iter().map(|(_, s)| s).collect()
+}
+
+/// `mnt_find_submount_by_devid()`: depth first through `ap`'s submounts.
+pub fn mnt_find_submount_by_devid(
+    ap: &crate::daemon::master::AutofsPoint,
+    devid: u64,
+) -> Option<std::sync::Arc<crate::daemon::master::AutofsPoint>> {
+    for s in mnts_submounts_of(ap) {
+        if s.lock().dev == devid {
+            return Some(s);
+        }
+        if let Some(f) = mnt_find_submount_by_devid(&s, devid) {
+            return Some(f);
+        }
+    }
+    None
+}
+
+/// `mnts_add_submount()`: the submount's entry, holding a reference, and on
+/// its parent's list; `None` on an owner conflict.
+pub fn mnts_add_submount(ap: &std::sync::Arc<crate::daemon::master::AutofsPoint>) -> bool {
+    let path = ap.path();
+    let mut g = MNTS.lock().unwrap();
+    let i = mnts_get_mount(&mut g, &path);
+    match g[i].sub_ap.as_ref().and_then(|w| w.upgrade()) {
+        None => g[i].sub_ap = Some(std::sync::Arc::downgrade(ap)),
+        Some(o) => {
+            let same_parent = match (&o.parent, &ap.parent) {
+                (Some(a), Some(b)) => a.id == b.id,
+                (None, None) => true,
+                _ => false,
+            };
+            if o.id != ap.id || !same_parent {
+                mnts_put_mount(&mut g, i);
+                drop(g);
+                error!(ap.logopt(), "mnts_add_submount", "conflict with submount owner: {}", path);
+                return false;
+            }
+        }
+    }
+    g[i].flags |= MNTS_AUTOFS;
+    if g[i].sub_seq == 0 {
+        g[i].sub_seq = MOUNT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    true
 }
 
 /// `umount_ent()` (the daemon isn't shutting down here): unmount `path`; what

@@ -63,6 +63,16 @@ macro_rules! logerr {
     };
 }
 
+/// autofs's own `assert(x)` (include/log.h): log `FILE:LINE: assertion
+/// failed: x` and carry on.
+macro_rules! c_assert {
+    ($cond:expr, $file:literal, $line:literal, $text:literal) => {
+        if !$cond {
+            $crate::libautofs::log::logmsg(concat!($file, ":", $line, ": assertion failed: ", $text).as_bytes())
+        }
+    };
+}
+
 /// `logmsg(msg, ...)`.
 macro_rules! logmsg {
     ($fmt:literal $(, $arg:expr)* $(,)?) => {

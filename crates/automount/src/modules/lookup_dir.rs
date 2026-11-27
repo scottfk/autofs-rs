@@ -16,7 +16,7 @@ const AUTOFS_DIR_EXT: &[u8] = b".autofs";
 
 #[derive(Debug)]
 pub struct LookupDir {
-    mapname: Vec<u8>,
+    mapname: std::sync::Mutex<Vec<u8>>,
 }
 
 /// `do_init()`.
@@ -47,7 +47,7 @@ fn do_init(argv: &Argv) -> Option<Vec<u8>> {
 
 /// `lookup_init()`.
 pub fn lookup_init(_mapfmt: Option<&[u8]>, argv: &Argv) -> Option<LookupDir> {
-    do_init(argv).map(|mapname| LookupDir { mapname })
+    do_init(argv).map(|mapname| LookupDir { mapname: std::sync::Mutex::new(mapname) })
 }
 
 /// `acceptable_dirent_p()`.
@@ -59,10 +59,10 @@ fn acceptable(name: &[u8]) -> bool {
 }
 
 impl LookupMod for LookupDir {
-    fn reinit(&mut self, _mapfmt: Option<&[u8]>, argv: &Argv) -> i32 {
+    fn reinit(&self, _mapfmt: Option<&[u8]>, argv: &Argv) -> i32 {
         match do_init(argv) {
             Some(m) => {
-                self.mapname = m;
+                *self.mapname.lock().unwrap() = m;
                 0
             }
             None => 1,
@@ -70,21 +70,22 @@ impl LookupMod for LookupDir {
     }
 
     /// `lookup_read_master()`.
-    fn read_master(&mut self, master: &Arc<Master>, age: i64) -> i32 {
+    fn read_master(&self, master: &Arc<Master>, age: i64) -> i32 {
         let logopt = master.logopt();
         if master.lock().depth > MAX_INCLUDE_DEPTH {
             error!(logopt, "lookup_read_master", "lookup(dir): maximum include depth exceeded {}", master.name());
             return NSS_STATUS_UNAVAIL;
         }
-        debug!(logopt, "lookup_read_master", "lookup(dir): scandir: {}", self.mapname);
-        let mut names = match sys::read_dir_names(&self.mapname) {
+        let mapname = self.mapname.lock().unwrap().clone();
+        debug!(logopt, "lookup_read_master", "lookup(dir): scandir: {}", mapname);
+        let mut names = match sys::read_dir_names(&mapname) {
             Ok(n) => n,
             Err(e) => {
                 error!(
                     logopt,
                     "lookup_read_master",
                     "lookup(dir): could not scan master map dir {}: {}",
-                    self.mapname,
+                    mapname,
                     sys::strerror(e)
                 );
                 return NSS_STATUS_UNAVAIL;
@@ -94,7 +95,7 @@ impl LookupMod for LookupDir {
         names.sort_by(|a, b| sys::versioncmp(a, b));
         for name in names {
             // include_file()
-            let mut path = self.mapname.clone();
+            let mut path = mapname.clone();
             path.push(b'/');
             path.extend_from_slice(&name);
             if path.len() > libc::PATH_MAX as usize {
@@ -115,11 +116,11 @@ impl LookupMod for LookupDir {
         NSS_STATUS_SUCCESS
     }
 
-    fn read_map(&mut self, _ap: &Arc<AutofsPoint>, _map: &Arc<MapSource>, _age: i64) -> i32 {
+    fn read_map(&self, _ap: &Arc<AutofsPoint>, _map: &Arc<MapSource>, _age: i64) -> i32 {
         NSS_STATUS_UNKNOWN
     }
 
-    fn done(self: Box<Self>) -> i32 {
+    fn done(&self) -> i32 {
         0
     }
 }

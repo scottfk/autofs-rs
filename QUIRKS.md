@@ -112,7 +112,7 @@ The last section lists where the port can't or doesn't follow C, and why.
 | low | A program's words are split at every space, and a closing quote ends a word, so two spaces, or a space after a quoted word, make an empty argument. | `parse_subs::construct_argv` | `amd_program_mounts` (`quoted`) |
 | low | `rmdir_path()` unlinks a symbolic link that's the last component and still fails. | `automount::rmdir_path` | - |
 
-## The daemon (daemon/automount.c, daemon/state.c, daemon/indirect.c, daemon/direct.c, daemon/flag.c, lib/mounts.c, modules/mount_bind.c, modules/parse_sun.c)
+## The daemon (daemon/automount.c, daemon/state.c, daemon/indirect.c, daemon/direct.c, daemon/flag.c, lib/mounts.c, modules/mount_*.c, modules/parse_sun.c)
 
 | Severity | Quirk | Where | Test |
 |---|---|---|---|
@@ -123,6 +123,9 @@ The last section lists where the port can't or doesn't follow C, and why.
 | low | A location without `:/` (`:tmpfs`) in a multi-mount entry that has one later (`/a/b :/etc/autofs`) swallows the rest of the entry: `chunklen()` skips blanks while it still expects a colon followed by `/`. | `parse_subs::chunklen` | `daemon_multi_indirect` |
 | low | At a forced shutdown, a direct or offset trigger that `askumount()` reports busy is detached without the "forcing umount" message: the path after the busy check reuses the 0 from `askumount()`. | `direct::do_umount_autofs_direct`, `direct::umount_autofs_offset` | - |
 | low | The duplicate offset message is spelled "duplcate offset detected". | `cache::update_offset` | `daemon_multi_indirect` (`dup`) |
+| low | autofs's `assert()` only logs (`state.c:578: assertion failed: ...`) and carries on: a submount told to shut down while it's still pruning gets there, and goes on to shut down. | `state::start_expire`, `c_assert!` | `daemon_submount_prune_and_hup` |
+| low | A `-fstype=autofs` entry whose map is a bare path (`/etc/autofs/auto.sub`) is a multi-mount entry (its location starts with `/`), so the submount isn't made; `:/path` and `file:/path` work. | `parse_sun::check_is_multi` | `daemon_submount_basic` (comment) |
+| low | `afs` entries fail on current kernels: the kernel has already made the key's directory, so the module's `symlink()` gets `EEXIST`. | `mount_afs` | `daemon_mount_modules` |
 | low | With several mounts, the order in which they shut down, reload or expire is a race between threads (and between `stderr` writes, which can run two messages together); C's own log order varies from run to run. | `state::st_queue_handler` | `daemon_two_mounts_and_null`, `daemon_hup_reload` (compared unordered) |
 
 ## Startup (daemon/automount.c, lib/mounts.c)
@@ -145,4 +148,5 @@ The last section lists where the port can't or doesn't follow C, and why.
 | An amd program map answer shorter than its key is read from a model of the reused answer buffer (the last answer's bytes past its NUL). In C what's there depends on the heap; glibc hands back the chunk the last answer freed, which the model follows. | Reading past the end of a string. |
 | A busy expire or map read thread that's asked to cancel stops at the point C tests for a cancel (`pthread_testcancel()`) or between steps, not at any cancellation point (`read()`, `nanosleep()`...) inside. | Rust has no thread cancellation. |
 | An autofs point's pipe and ioctl descriptors start as 0: C `malloc()`s the structure and only sets them when it opens the pipe, so with `-U` they're whatever the memory held (0 on a fresh heap). | Uninitialized memory. |
+| Restarting over a mounted multi-mount in a direct map reconnects to it. C deadlocks there: `mount_autofs_direct()` holds the map cache's read lock while it reconnects each trigger, and re-reading the multi-mount entry takes the same cache's write lock (`cache_writelock()` in the same thread), so the daemon hangs at startup. | An upstream self-deadlock; the port's cache locks are only held briefly. Not compared (`daemon_restart_direct` leaves the multi-mount unmounted). |
 | A panic (a path not ported yet) aborts the daemon, rather than leaving the kernel waiting on a request thread that's gone. | Only for what isn't ported. |

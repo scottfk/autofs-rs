@@ -166,8 +166,10 @@ pub fn close_mount_fds(ap: &Arc<AutofsPoint>) {
         let a = ap.lock();
         (a.submount, a.pipefd, a.kpipefd)
     };
-    if submount {
-        panic!("submounts aren't ported yet (phase 4)");
+    // Submounts look after themselves, so the parent never knows to close
+    // the descriptors of offset mounts: done here.
+    if submount && let Some(parent) = ap.parent.as_ref() {
+        lookup::lookup_source_close_ioctlfd(parent, &ap.path());
     }
     if p >= 0 {
         sys::close(p);

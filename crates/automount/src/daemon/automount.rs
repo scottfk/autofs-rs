@@ -1561,7 +1561,12 @@ fn handle_mounts_cleanup(ap: &Arc<AutofsPoint>) {
     };
     let clean = !submount && path != b"/-" && flags & MOUNT_FLAG_DIR_CREATED != 0;
     if submount {
-        panic!("submounts aren't ported yet (phase 4)");
+        // The submount is on its parent's submount and mounted lists.
+        mounts::mnts_remove_submount(&path);
+        mounts::mnts_remove_mount(&path, mounts::MNTS_MOUNTED);
+        if mounts::mnts_find_amdmount(&path).is_some() {
+            mounts::mnts_remove_amdmount(&path);
+        }
     }
     // Don't signal the handler if that was done already.
     let pending = !master.lock().completed.is_empty();

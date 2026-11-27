@@ -223,11 +223,13 @@ fn daemon_options() {
     );
 }
 
-const EXPIRE_CYCLE: [&str; 7] = [
+const EXPIRE_CYCLE: [&str; 9] = [
     "st_expire: state",
     "expire_proc: exp_proc",
     "expire_proc_indirect: expire ",
     "remaining in /mnt",
+    "remaining in /-",
+    "expire_proc_direct: send expire to trigger",
     "expire_cleanup: got thid",
     "expire_cleanup: sigchld",
     "st_ready(): state = 2",
@@ -259,7 +261,7 @@ fn daemon_symlinks() {
                 "waitlog 'mounted indirect on /mnt/s'; quiet 0.5\ntrig /mnt/a/l/; waitlog 'mounted /mnt/a/l'\n\
                  trig /mnt/a/tc/; waitlog 'mounted /mnt/a/tc'\ntrig /mnt/s/b/; waitlog 'mounted /mnt/s/b'\n\
                  trig /mnt/a/self; waitlog 'failed to mount /mnt/a/self'\n\
-                 ls -l /mnt/a /mnt/s | sed 's/.* \\([^ ]* -> \\)/\\1/' >> $C/out/steps\nsnap\n\
+                 ls -l --time-style=+ /mnt/a /mnt/s | sed 's/.* \\([^ ]* -> \\)/\\1/' >> $C/out/steps\nsnap\n\
                  sig USR1; waitlog 'removing symlink /mnt/a/l'; quiet 1\nls /mnt/a /mnt/s >> $C/out/steps\n",
             ),
     );
@@ -277,7 +279,7 @@ fn daemon_amd_section() {
             .steps(
                 "waitlog 'mounted indirect on /mnt/n'; quiet 0.5\ntrig /mnt/m/x/; waitlog 'mounted /mnt/m/x'\n\
                  trig /mnt/n/y/; waitlog 'mounted /mnt/n/y'\ntrig /mnt/m/t; waitlog '/mnt/m/t'; quiet 0.5\n\
-                 ls -l /mnt/m /mnt/n | sed 's/.* \\([^ ]* -> \\)/\\1/' >> $C/out/steps\nsnap\n",
+                 ls -l --time-style=+ /mnt/m /mnt/n | sed 's/.* \\([^ ]* -> \\)/\\1/' >> $C/out/steps\nsnap\n",
             ),
     );
 }
@@ -440,5 +442,162 @@ fn daemon_multi_forced_shutdown_indirect() {
     check_vm(VmCase::new("d_multi_force_ind", "/mnt/a /etc/autofs/auto.a\n").map("auto.a", MMAP).steps(
         "ready\ntrig /mnt/a/m; waitlog 'mounted /mnt/a/m'; quiet 0.5\ntrig /mnt/a/m/sub; waitlog 'mounted /mnt/a/m/sub'\n\
          (cd /mnt/a/m/sub && sleep 3) &\nquiet 0.5\nsig USR2; waitlog 'autofs stopped' 100 x\nsnap\nwait\n",
+    ));
+}
+
+// Locations are `:/path` or `file:/path`: a bare `/path` makes the entry a
+// multi-mount.
+const SUBMAP: &str = "sub -fstype=autofs file:/etc/autofs/auto.sub\n\
+                      opts -fstype=autofs,browse,timeout=3,symlink,nobind,ro, :/etc/autofs/auto.sub\n\
+                      nest -fstype=autofs :/etc/autofs/auto.nest\nbad -fstype=autofs :/etc/autofs/nosuch\n";
+const SUB: &str = "x -fstype=tmpfs :/t\nl -fstype=bind :/etc/autofs\n";
+const NEST: &str = "in -fstype=autofs,nobrowse :/etc/autofs/auto.sub\n";
+
+fn subcase(name: &str, master: &str) -> VmCase {
+    VmCase::new(name, master).map("auto.a", SUBMAP).map("auto.sub", SUB).map("auto.nest", NEST)
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_submount_basic() {
+    check_vm(subcase("d_sub_basic", "/mnt/a /etc/autofs/auto.a\n").unordered_log().steps(
+        "ready\ntrig /mnt/a/sub; waitlog 'mounted indirect on /mnt/a/sub'; quiet 0.5\nsnap\n\
+         trig /mnt/a/sub/x; waitlog 'mounted /mnt/a/sub/x'\ntrig /mnt/a/opts; waitlog 'mounted indirect on /mnt/a/opts'; quiet 0.5\n\
+         ls /mnt/a/opts >> $C/out/steps\ntrig /mnt/a/opts/l/; waitlog 'mounted /mnt/a/opts/l'\n\
+         trig /mnt/a/nest/in/x; waitlog 'mounted /mnt/a/nest/in/x'\ntrig /mnt/a/bad; waitlog 'failed to mount /mnt/a/bad'\n\
+         trig /mnt/a/sub/nope; waitlog 'failed to mount /mnt/a/sub/nope'\nsnap\nstopd\n",
+    ));
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_submount_expire() {
+    check_vm(subcase("d_sub_expire", "/mnt/a /etc/autofs/auto.a --timeout=2\n").drop_lines(&EXPIRE_CYCLE).steps(
+        "ready\ntrig /mnt/a/sub/x; waitlog 'mounted /mnt/a/sub/x'\nsnap\n\
+         waitlog 'shut down path /mnt/a/sub' 150; quiet 1.5\nsnap\n",
+    ));
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_submount_direct() {
+    check_vm(
+        VmCase::new("d_sub_direct", "/- /etc/autofs/auto.d\n")
+            .map("auto.d", "/mnt/ds -fstype=autofs /etc/autofs/auto.sub\n")
+            .map("auto.sub", SUB)
+            .unordered_log()
+            .steps(
+                "waitlog 'mounted trigger /mnt/ds'; quiet 0.5\ntrig /mnt/ds/x; waitlog 'mounted /mnt/ds/x'\nsnap\nstopd\n",
+            ),
+    );
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_submount_busy_shutdown() {
+    check_vm(subcase("d_sub_busy", "/mnt/a /etc/autofs/auto.a\n").unordered_log().steps(
+        "ready\ntrig /mnt/a/sub/x; waitlog 'mounted /mnt/a/sub/x'\n(cd /mnt/a/sub/x && sleep 4) &\nquiet 0.5\n\
+         sig TERM; waitlog 'autofs stopped' 100 x; note busy\nsnap\nwait\n",
+    ));
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_submount_prune_and_hup() {
+    check_vm(subcase("d_sub_hup", "/mnt/a /etc/autofs/auto.a\n").unordered_log().steps(
+        "ready\ntrig /mnt/a/sub/x; waitlog 'mounted /mnt/a/sub/x'\ntrig /mnt/a/opts; waitlog 'mounted indirect on /mnt/a/opts'\n\
+         quiet 1\nsig USR1; quiet 2\nsnap\nprintf 'y -fstype=tmpfs :/t\\n' >> /etc/autofs/auto.sub\nquiet 2\n\
+         sig HUP; quiet 2\ntrig /mnt/a/sub/y; waitlog 'mounted /mnt/a/sub/y'\nsnap\nstopd\n",
+    ));
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_mount_modules() {
+    // ext2/3/4 with their fsck run (a clean image, a read-only one, one that
+    // needs repair, a missing one), AFS symlinks, and a "changer" that isn't.
+    let pre = "mkfs.ext2 -q -F /tmp/e2.img 1M\nmkfs.ext3 -q -F /tmp/e3.img 2M\nmkfs.ext2 -q -F /tmp/bad.img 1M\n\
+               debugfs -w -R \"clri <2>\" /tmp/bad.img >/dev/null 2>&1\n\
+               debugfs -w -R \"ssv state 0\" /tmp/bad.img >/dev/null 2>&1\n";
+    check_vm(
+        VmCase::new("d_modules", "/mnt/a /etc/autofs/auto.a\n")
+            .map(
+                "auto.a",
+                "e2 -fstype=ext2,loop :/tmp/e2.img\ne3ro -fstype=ext3,ro,loop :/tmp/e3.img\ne2ro -fstype=ext2,loop,ro :/tmp/e2.img\nbad -fstype=ext2,loop :/tmp/bad.img\n\
+                 gone -fstype=ext4 :/tmp/nosuch.img\nafs -fstype=afs :/etc/autofs\nchg -fstype=changer :/dev/null\n\
+                 chg2 -fstype=changer :/dev/nosuch\n",
+            )
+            .pre(pre)
+            .steps(
+                "ready\ntrig /mnt/a/e2; waitlog 'mounted /mnt/a/e2'\ntrig /mnt/a/e3ro; waitlog 'mounted /mnt/a/e3ro'\ntrig /mnt/a/e2ro; waitlog 'failed to mount /mnt/a/e2ro\\|mounted /mnt/a/e2ro'\n\
+                 trig /mnt/a/bad; waitlog 'failed to mount /mnt/a/bad'\ntrig /mnt/a/gone; waitlog 'failed to mount /mnt/a/gone'\n\
+                 trig /mnt/a/afs/; waitlog 'mounted /mnt/a/afs'\ntrig /mnt/a/chg; waitlog 'failed to mount /mnt/a/chg'\n\
+                 trig /mnt/a/chg2; waitlog 'failed to mount /mnt/a/chg2'\nls -l /mnt/a | awk '{print $1, $NF}' >> $C/out/steps\nsnap\n",
+            ),
+    );
+}
+
+// Restart over existing mounts (README.active-restart): the daemon is
+// killed with SIGKILL, leaving its autofs and real mounts, and started again
+// over them, so it reconnects to each.
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_restart_indirect() {
+    check_vm(
+        VmCase::new("d_restart_ind", "/mnt/a /etc/autofs/auto.a\n/mnt/n /etc/autofs/auto.a -nobrowse\n")
+            .map("auto.a", MAP)
+            .unordered_log()
+            .steps(
+                "waitlog 'mounted indirect on /mnt/n'; quiet 0.5\ntrig /mnt/a/t; waitlog 'mounted /mnt/a/t'\n\
+                 trig /mnt/a/k/; waitlog 'mounted /mnt/a/k'\ntrig /mnt/n/t; waitlog 'mounted /mnt/n/t'\nsnap\n\
+                 restartd\nwaitlog 're-connected to mount /mnt/n' 100; quiet 2\nsnap\n\
+                 trig /mnt/a/ro; waitlog 'mounted /mnt/a/ro'\nsnap\nstopd\n",
+            ),
+    );
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_restart_direct() {
+    // Not with a mounted multi-mount: C deadlocks reconnecting to one in a
+    // direct map (see QUIRKS.md, "Where the port differs").
+    check_vm(
+        VmCase::new("d_restart_dir", "/- /etc/autofs/auto.d\n")
+            .map("auto.d", &format!("{DMAP}{MDIR}"))
+            .unordered_log()
+            .steps(
+                "waitlog 'mounted trigger /mnt/mm'; quiet 0.5\ntrig /mnt/d1; waitlog 'mounted /mnt/d1'\n\
+                 trig /mnt/deep/er/d3; waitlog 'mounted /mnt/deep/er/d3'\nsnap\n\
+                 restartd\nwaitlog 're-connected to mount /mnt/mm' 100; quiet 2\nsnap\n\
+                 trig /mnt/d2/; waitlog 'mounted /mnt/d2'\ntrig /mnt/mm/in; waitlog 'mounted /mnt/mm/in'\nsnap\nstopd\n",
+            ),
+    );
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_restart_multi_indirect() {
+    check_vm(
+        VmCase::new("d_restart_multi", "/mnt/a /etc/autofs/auto.a --timeout=3\n")
+            .map("auto.a", MMAP)
+            .unordered_log()
+            .drop_lines(&EXPIRE_CYCLE)
+            .steps(
+                "ready\ntrig /mnt/a/m; waitlog 'mounted /mnt/a/m'; quiet 0.5\ntrig /mnt/a/m/sub; waitlog 'mounted /mnt/a/m/sub'\nsnap\n\
+                 restartd\nwaitlog 're-connected to mount /mnt/a' 100; quiet 1\nsnap\n\
+                 trig /mnt/a/m/a/b/; waitlog 'mounted /mnt/a/m/a/b'\nsnap\n\
+                 waitlog 'umounting /mnt/a/m succeeded' 200; quiet 1.5\nsnap\nstopd\n",
+            ),
+    );
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_restart_submount() {
+    check_vm(subcase("d_restart_sub", "/mnt/a /etc/autofs/auto.a\n").unordered_log().steps(
+        "ready\ntrig /mnt/a/sub/x; waitlog 'mounted /mnt/a/sub/x'\nsnap\n\
+         restartd\nwaitlog 're-connected to mount /mnt/a/sub' 100; quiet 2\nsnap\n\
+         trig /mnt/a/sub/l/; waitlog 'mounted /mnt/a/sub/l'\nsnap\nstopd\n",
     ));
 }
