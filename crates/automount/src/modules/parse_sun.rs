@@ -29,15 +29,32 @@ static NFS: Mutex<(Option<Box<dyn MountMod>>, u32)> = Mutex::new((None, 0));
 
 /// A `struct parse_context`.
 #[derive(Debug)]
-pub struct ParseSun {
+pub struct SunCtx {
     pub optstr: Option<Vec<u8>>,
     pub macros: Option<Vec<u8>>,
     pub subst: Table,
     pub slashify_colons: bool,
 }
 
-fn default_context() -> ParseSun {
-    ParseSun { optstr: None, macros: None, subst: Vec::new(), slashify_colons: true }
+/// The parser's context (`struct parse_context`), shared by every caller:
+/// held only briefly, never across a mount.
+#[derive(Debug)]
+pub struct ParseSun {
+    ctx: Mutex<SunCtx>,
+}
+
+impl ParseSun {
+    fn optstr(&self) -> Option<Vec<u8>> {
+        self.ctx.lock().unwrap().optstr.clone()
+    }
+
+    fn macros(&self) -> Option<Vec<u8>> {
+        self.ctx.lock().unwrap().macros.clone()
+    }
+}
+
+fn default_context() -> SunCtx {
+    SunCtx { optstr: None, macros: None, subst: Vec::new(), slashify_colons: true }
 }
 
 /// `concat_options()`.
@@ -59,7 +76,7 @@ fn concat_options(left: Option<Vec<u8>>, right: Option<Vec<u8>>) -> Option<Vec<u
 }
 
 /// `do_init()`.
-fn do_init(argv: &Argv, ctxt: &mut ParseSun) -> i32 {
+fn do_init(argv: &Argv, ctxt: &mut SunCtx) -> i32 {
     let argc = argv.len();
     let mut i = 0;
     while i < argc {
@@ -156,7 +173,7 @@ pub fn parse_init(argv: &Argv) -> Option<ParseSun> {
         g.0 = Some(m);
         g.1 += 1;
     }
-    Some(ctxt)
+    Some(ParseSun { ctx: Mutex::new(ctxt) })
 }
 
 /// `expandsunent()`: `&` is the key (white space in it escaped), `$NAME` and
@@ -415,7 +432,7 @@ impl ParseSun {
             options = Some(cstr::c(&np).to_vec());
         }
         if fstype == b"autofs"
-            && let Some(m) = &self.macros
+            && let Some(m) = &self.macros()
         {
             let mut n = match &options {
                 Some(o) if !o.is_empty() => {
@@ -516,11 +533,11 @@ impl ParseSun {
 
 impl ParseMod for ParseSun {
     fn subst(&self) -> Option<Table> {
-        Some(self.subst.clone())
+        Some(self.ctx.lock().unwrap().subst.clone())
     }
 
     /// `parse_mount()`.
-    fn mount(&mut self, ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, name: &[u8], mapent: Option<&[u8]>) -> i32 {
+    fn mount(&self, ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, name: &[u8], mapent: Option<&[u8]>) -> i32 {
         let logopt = ap.logopt();
         let Some(mapent) = mapent else {
             warn!(logopt, "parse(sun): error: empty map entry");
@@ -537,19 +554,20 @@ impl ParseMod for ParseSun {
             cstr::c(mapent).to_vec()
         } else {
             let _l = macros::macro_lock();
-            mounts::addstdenv(&mut self.subst, None);
-            let e = expandsunent(mapent, name, &self.subst, self.slashify_colons);
+            let mut c = self.ctx.lock().unwrap();
+            mounts::addstdenv(&mut c.subst, None);
+            let e = expandsunent(mapent, name, &c.subst, c.slashify_colons);
+            mounts::removestdenv(&mut c.subst, None);
+            drop(c);
             if e.is_empty() {
                 error!(logopt, "parse_mount", "parse(sun): failed to expand map entry");
-                mounts::removestdenv(&mut self.subst, None);
                 return 1;
             }
-            mounts::removestdenv(&mut self.subst, None);
             e
         };
         debug!(logopt, "parse_mount", "parse(sun): expanded entry: {}", pmapent);
         let append_options = defaults::defaults_get_append_options() != 0;
-        let mut options: Option<Vec<u8>> = Some(self.optstr.clone().unwrap_or_default());
+        let mut options: Option<Vec<u8>> = Some(self.optstr().unwrap_or_default());
         let mut p = skipspace(&pmapent);
         let at = |i: usize| pmapent.get(i).copied().unwrap_or(0);
         if at(p) == b'-' {
@@ -663,17 +681,17 @@ impl ParseMod for ParseSun {
     }
 
     /// `parse_reinit()`.
-    fn reinit(&mut self, argv: &Argv) -> i32 {
+    fn reinit(&self, argv: &Argv) -> i32 {
         let mut new = default_context();
         if do_init(argv, &mut new) != 0 {
             return 1;
         }
-        *self = new;
+        *self.ctx.lock().unwrap() = new;
         0
     }
 
     /// `parse_done()`.
-    fn done(self: Box<Self>) -> i32 {
+    fn done(&self) -> i32 {
         let m = {
             let mut g = NFS.lock().unwrap();
             g.1 = g.1.wrapping_sub(1);

@@ -11,7 +11,7 @@
 //!
 //! Normalized before comparing: thread ids, the kernel's wait queue tokens
 //! (renumbered in order of appearance), requesting pids, the daemon's
-//! process group, and `/tmp/autoXXXXXX`
+//! process group, the kernel pipe's descriptor in mount options, and `/tmp/autoXXXXXX`
 //! names.
 
 use std::io::Write;
@@ -278,8 +278,11 @@ fn normalize(s: &str, names: &mut Vec<String>) -> String {
     let s = renumber(&s, "request pid ", "P");
     let s = renumber(&s, " pid:", "Q");
     let s = renumber(&s, " tgid:", "Q");
-    // The daemon's process group, in the trigger mount options.
+    // The daemon's process group, in the trigger mount options, and the pipe
+    // descriptor (the command FIFO thread opens its FIFO at the same time as
+    // the first mount opens its pipe, in C too).
     let s = renumber(&s, ",pgrp=", "G");
+    let s = renumber(&s, " -o fd=", "F");
     normalize_tmp(&s, names)
 }
 
@@ -383,6 +386,9 @@ pub fn check_vm(case: VmCase) -> VmOutcome {
                 let mut rest = line.to_string();
                 'again: loop {
                     for st in &starts {
+                        if rest.is_empty() {
+                            break;
+                        }
                         if let Some(p) = rest[1..].find(st.as_str()) {
                             let p = p + 1;
                             out.push(rest[..p].to_string());

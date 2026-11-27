@@ -241,7 +241,7 @@ pub fn spawn_detached(name: &str, f: impl FnOnce() + Send + 'static) -> Option<u
 
 /// `expire_proc()`: start the expire thread.
 fn expire_proc(ap: &Arc<AutofsPoint>, how: u32) -> i32 {
-    assert_eq!(ap.lock().exp_thread, 0);
+    c_assert!(ap.lock().exp_thread == 0, "state.c", "219", "ap->exp_thread == 0");
     let hs = Arc::new(Handshake::new());
     hs.hold();
     let (ap2, hs2) = (ap.clone(), hs.clone());
@@ -441,8 +441,8 @@ fn readmap_direct(ap: &Arc<AutofsPoint>, now: i64) {
 fn st_readmap(ap: &Arc<AutofsPoint>) -> bool {
     let now = sys::monotonic_time();
     debug!(ap.logopt(), "st_readmap", "state {} path {}", state_of(ap), ap.path());
-    assert_eq!(state_of(ap), ST_READY);
-    assert_eq!(ap.lock().readmap_thread, 0);
+    c_assert!(state_of(ap) == ST_READY, "state.c", "516", "ap->state == ST_READY");
+    c_assert!(ap.lock().readmap_thread == 0, "state.c", "517", "ap->readmap_thread == 0");
     set_state(ap, ST_READMAP);
     let hs = Arc::new(Handshake::new());
     hs.hold();
@@ -465,7 +465,17 @@ fn st_readmap(ap: &Arc<AutofsPoint>) -> bool {
 fn start_expire(ap: &Arc<AutofsPoint>, func: &str, from_ok: &[i32], new: i32, how: u32) -> bool {
     let m = bfmt!("{}: state {} path {}", func, state_of(ap), ap.path());
     crate::libautofs::log::log_debug(ap.logopt(), &m);
-    assert!(from_ok.contains(&state_of(ap)));
+    if !from_ok.contains(&state_of(ap)) {
+        // assert() at state.c:578 (st_prepare_shutdown), 603
+        // (st_force_shutdown), 642 (st_prune) and 662 (st_expire).
+        let (line, text): (&str, &str) = match func {
+            "st_prepare_shutdown" => ("578", "ap->state == ST_READY || ap->state == ST_EXPIRE"),
+            "st_force_shutdown" => ("603", "ap->state == ST_READY || ap->state == ST_EXPIRE"),
+            "st_prune" => ("642", "ap->state == ST_READY"),
+            _ => ("662", "ap->state == ST_READY"),
+        };
+        crate::libautofs::log::logmsg(&bfmt!("state.c:{}: assertion failed: {}", line, text));
+    }
     set_state(ap, new);
     if expire_proc(ap, how) == EXP_STARTED {
         return true;
@@ -479,7 +489,12 @@ fn start_expire(ap: &Arc<AutofsPoint>, func: &str, from_ok: &[i32], new: i32, ho
 /// `st_shutdown()`: wake the mount handler thread to finish the shutdown.
 fn st_shutdown(ap: &Arc<AutofsPoint>) -> bool {
     debug!(ap.logopt(), "st_shutdown", "state {} path {}", state_of(ap), ap.path());
-    assert!(matches!(state_of(ap), ST_SHUTDOWN_PENDING | ST_SHUTDOWN_FORCE));
+    c_assert!(
+        matches!(state_of(ap), ST_SHUTDOWN_PENDING | ST_SHUTDOWN_FORCE),
+        "state.c",
+        "628",
+        "ap->state == ST_SHUTDOWN_PENDING || ap->state == ST_SHUTDOWN_FORCE"
+    );
     set_state(ap, ST_SHUTDOWN);
     let thid = ap.lock().thid;
     let ret = sys::pthread_kill(thid, libc::SIGCONT);

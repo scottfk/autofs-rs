@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use crate::daemon::lookup;
-use crate::daemon::module::LookupMod;
 use crate::libautofs::args::{self, Argv};
 use crate::libautofs::cache::Cache;
 use crate::libautofs::cstr;
@@ -62,7 +61,7 @@ pub struct MapSourceData {
     pub recurse: bool,
     pub depth: u32,
     pub argv: Argv,
-    pub lookup: Option<Box<dyn LookupMod>>,
+    pub lookup: Option<crate::daemon::module::Lookup>,
     /// The instances, head first.
     pub instances: Vec<Arc<MapSource>>,
     pub exp_timeout: i64,
@@ -332,6 +331,18 @@ pub fn master_add_mapent(master: &Master, entry: Arc<MasterMapent>) {
 
 /// `master_add_autofs_point()`.
 pub fn master_add_autofs_point(entry: &Arc<MasterMapent>, logopt: u32, nobind: bool, ghost: bool, submount: bool) {
+    master_add_autofs_point_parent(entry, logopt, nobind, ghost, submount, None);
+}
+
+/// `master_add_autofs_point()` with `ap->parent` set (a submount's).
+pub fn master_add_autofs_point_parent(
+    entry: &Arc<MasterMapent>,
+    logopt: u32,
+    nobind: bool,
+    ghost: bool,
+    submount: bool,
+    parent: Option<Arc<AutofsPoint>>,
+) {
     let g = GLOBALS.lock().unwrap();
     let negative_timeout =
         if g.negative_timeout <= 0 { defaults::defaults_get_negative_timeout() } else { g.negative_timeout as u32 };
@@ -377,7 +388,7 @@ pub fn master_add_autofs_point(entry: &Arc<MasterMapent>, logopt: u32, nobind: b
         }),
         id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
         entry: Arc::downgrade(entry),
-        parent: None,
+        parent,
     });
     entry.lock().ap = Some(ap);
 }
@@ -442,6 +453,26 @@ pub fn master_add_map_source(
     let source = MapSource::new(d);
     entry.lock().maps.push(source.clone());
     source
+}
+
+/// `master_get_map_source()`: the entry's map source of this type, format
+/// and arguments, with a reference taken.
+pub fn master_get_map_source(
+    entry: &Arc<MasterMapent>,
+    ty: Option<&[u8]>,
+    format: Option<&[u8]>,
+    argv: &Argv,
+) -> Option<Arc<MapSource>> {
+    entry.source_readlock();
+    let found = entry.maps().into_iter().find(|m| {
+        let md = m.lock();
+        compare_source_type_and_format(&md, ty, format) && args::compare_argv(&md.argv, argv)
+    });
+    if let Some(f) = &found {
+        f.lock().refcnt += 1;
+    }
+    entry.source_unlock();
+    found
 }
 
 /// `master_find_source_instance()`.
@@ -1057,9 +1088,35 @@ pub fn master_read_master(master: &Arc<Master>, age: i64) -> bool {
 
 /// `master_notify_submount()`: pass a state change to the submount at `path`.
 pub fn master_notify_submount(ap: &Arc<AutofsPoint>, path: &[u8], state: i32) -> i32 {
-    let Some(sub) = crate::libautofs::mounts::mnts_find_submount(path) else { return 1 };
-    let _ = (ap, state, sub);
-    panic!("submounts aren't ported yet (phase 4)");
+    use crate::libautofs::mounts::mnts_find_submount;
+    let Some(this) = mnts_find_submount(path) else { return 1 };
+    let mut ret = 1;
+    // A submount to expire.
+    state::st_mutex_lock();
+    if this.lock().state == ST_SHUTDOWN {
+        state::st_mutex_unlock();
+        return ret;
+    }
+    let shutdown = ap.lock().shutdown;
+    this.lock().shutdown = shutdown;
+    state::st_add_task_locked(&this, state);
+    state::st_mutex_unlock();
+    state::st_wait_task(&this, state, 0);
+    // A submount going to ST_SHUTDOWN_PENDING or ST_SHUTDOWN_FORCE is waited
+    // for until it goes, or changes to ST_SHUTDOWN or ST_READY.
+    state::st_mutex_lock();
+    while let Some(sb) = mnts_find_submount(path) {
+        let st = sb.lock().state;
+        if st != ST_SHUTDOWN_PENDING && st != ST_SHUTDOWN_FORCE {
+            ret = 0;
+            break;
+        }
+        state::st_mutex_unlock();
+        sys::nanosleep_once(300_000_000);
+        state::st_mutex_lock();
+    }
+    state::st_mutex_unlock();
+    ret
 }
 
 /// `master_notify_state_change()`: a signal's state change for every mount.
@@ -1089,7 +1146,7 @@ pub fn master_notify_state_change(master: &Arc<Master>, sig: i32) {
                     }
                 }
                 libc::SIGUSR1 => {
-                    assert_eq!(st, ST_READY);
+                    c_assert!(st == ST_READY, "master.c", "1318", "ap->state == ST_READY");
                     next = ST_PRUNE;
                     state::st_add_task_locked(&ap, next);
                 }
@@ -1141,6 +1198,25 @@ fn master_do_mount(entry: &Arc<MasterMapent>) -> bool {
     ap.lock().thid = h.as_pthread_t();
     JOINS.lock().unwrap().push((ap.id, h));
     true
+}
+
+/// Submount entries: on no master list, only their autofs point refers to
+/// them (C's `nap->entry`). Held here until `master_done()` frees them.
+static SUBMOUNT_ENTRIES: Mutex<Vec<Arc<MasterMapent>>> = Mutex::new(Vec::new());
+
+/// Keep a submount's entry alive (see `SUBMOUNT_ENTRIES`).
+pub fn hold_submount_entry(entry: &Arc<MasterMapent>) {
+    SUBMOUNT_ENTRIES.lock().unwrap().push(entry.clone());
+}
+
+/// Let go of a submount's entry, when it's freed.
+pub fn release_submount_entry(entry: &Arc<MasterMapent>) {
+    SUBMOUNT_ENTRIES.lock().unwrap().retain(|e| !Arc::ptr_eq(e, entry));
+}
+
+/// Keep a mount handler thread for `master_done()` to join.
+pub fn add_join(id: usize, h: std::thread::JoinHandle<()>) {
+    JOINS.lock().unwrap().push((id, h));
 }
 
 /// The mount handler threads, joined by `master_done()`.
@@ -1235,7 +1311,11 @@ pub fn master_mount_mounts(master: &Arc<Master>, age: i64) -> bool {
 pub fn master_remove_mapent(master: &Master, entry: &Arc<MasterMapent>) {
     let ap = entry.ap();
     if ap.lock().submount {
-        panic!("submounts aren't ported yet (phase 4)");
+        if crate::libautofs::mounts::mnts_is_submount(&ap.path()) {
+            warn!(ap.logopt(), "map entry {} in use at shutdown", ap.path());
+        }
+        master.lock().completed.insert(0, entry.clone());
+        return;
     }
     let mut m = master.lock();
     if let Some(i) = m.mounts.iter().position(|e| Arc::ptr_eq(e, entry)) {
@@ -1258,6 +1338,7 @@ pub fn master_done(master: &Master) -> bool {
             let _ = h.join();
         }
         master_free_mapent_sources(&entry);
+        release_submount_entry(&entry);
     }
     master.lock().mounts.is_empty()
 }
@@ -1284,7 +1365,7 @@ pub fn master_find_mapent_by_devid(master: &Master, devid: u64) -> Option<Arc<Au
             found = Some(ap);
             break;
         }
-        if let Some(s) = crate::libautofs::mounts::mnts_submounts_of(&ap).into_iter().find(|s| s.lock().dev == devid) {
+        if let Some(s) = crate::libautofs::mounts::mnt_find_submount_by_devid(&ap, devid) {
             found = Some(s);
             break;
         }

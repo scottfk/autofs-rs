@@ -17,7 +17,7 @@ use crate::sys;
 /// `do_read_master()`.
 fn do_read_master(master: &Arc<Master>, ty: &[u8], age: i64) -> i32 {
     let argv: Argv = vec![Some(master.name())];
-    let mut lookup = match module::open_lookup(ty, Some(b""), None, &argv) {
+    let lookup = match module::open_lookup(ty, Some(b""), None, &argv) {
         Ok(l) => l,
         Err(s) => return s,
     };
@@ -198,17 +198,15 @@ fn do_read_map(ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, age: i64) -> i32 {
             let m = map.lock();
             (m.format.clone(), m.argv.clone())
         };
-        let mut l = map.lock().lookup.take().unwrap();
+        let l = map.lock().lookup.clone().unwrap();
         let status = l.reinit(format.as_deref(), &argv);
-        map.lock().lookup = Some(l);
         if status != 0 {
             warn!(logopt, "lookup module {} reinit failed", map.ty().unwrap_or_default());
             return status;
         }
     }
-    let mut l = map.lock().lookup.take().unwrap();
+    let l = map.lock().lookup.clone().unwrap();
     let status = l.read_map(ap, map, age);
-    map.lock().lookup = Some(l);
     if status != NSS_STATUS_SUCCESS {
         map.lock().stale = false;
     }
@@ -616,10 +614,9 @@ pub fn do_lookup_mount(ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, name: &[u8])
             }
         }
     }
-    let mut l = map.lock().lookup.take().unwrap();
-    let status = l.mount(ap, map, name);
-    map.lock().lookup = Some(l);
-    status
+    // Shared with any other lookup in this map, nested or concurrent.
+    let l = map.lock().lookup.clone().unwrap();
+    l.mount(ap, map, name)
 }
 
 /// `lookup_name_file_source_instance()`.
@@ -950,4 +947,22 @@ pub fn lookup_ghost(ap: &Arc<AutofsPoint>) -> u32 {
         }
     }
     LKP_INDIRECT
+}
+
+/// `lookup_source_close_ioctlfd()`: close the descriptor of `key`'s entry in
+/// the first map that has it; whether one did.
+pub fn lookup_source_close_ioctlfd(ap: &AutofsPoint, key: &[u8]) -> bool {
+    for map in ap.entry().maps() {
+        let mc = map.mc();
+        let mut c = mc.lock();
+        if let Some(p) = c.lookup_distinct(key) {
+            let fd = c.get(p).ioctlfd;
+            if fd != -1 {
+                crate::libautofs::dev_ioctl::close(fd);
+                c.get_mut(p).ioctlfd = -1;
+            }
+            return true;
+        }
+    }
+    false
 }

@@ -18,29 +18,39 @@ use crate::libautofs::nsswitch::NSS_STATUS_UNKNOWN;
 use crate::modules;
 
 /// A lookup module's entry points (`lookup_init()` is its constructor).
-pub trait LookupMod: Send + std::fmt::Debug {
-    fn reinit(&mut self, mapfmt: Option<&[u8]>, argv: &Argv) -> i32;
-    fn read_master(&mut self, master: &Arc<Master>, age: i64) -> i32;
-    fn read_map(&mut self, ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, age: i64) -> i32;
+///
+/// As in C, one context serves every caller at once: mount threads looking
+/// up keys in the same map, and lookups nested in another (reconnecting to an
+/// offset re-reads its map entry). So the methods take `&self`, and what a
+/// module changes sits behind locks held only briefly.
+pub trait LookupMod: Send + Sync + std::fmt::Debug {
+    fn reinit(&self, mapfmt: Option<&[u8]>, argv: &Argv) -> i32;
+    fn read_master(&self, master: &Arc<Master>, age: i64) -> i32;
+    fn read_map(&self, ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, age: i64) -> i32;
     /// `lookup_mount()`.
-    fn mount(&mut self, _ap: &Arc<AutofsPoint>, _map: &Arc<MapSource>, name: &[u8]) -> i32 {
+    fn mount(&self, _ap: &Arc<AutofsPoint>, _map: &Arc<MapSource>, name: &[u8]) -> i32 {
         panic!("lookup_mount for {} isn't ported yet", String::from_utf8_lossy(name));
     }
-    fn done(self: Box<Self>) -> i32;
+    fn done(&self) -> i32;
 }
 
-/// A parse module's entry points.
-pub trait ParseMod: Send + std::fmt::Debug {
-    fn reinit(&mut self, argv: &Argv) -> i32;
+/// An open lookup module.
+pub type Lookup = Arc<dyn LookupMod>;
+/// An open parse module.
+pub type Parse = Arc<dyn ParseMod>;
+
+/// A parse module's entry points (shared, as lookup modules are).
+pub trait ParseMod: Send + Sync + std::fmt::Debug {
+    fn reinit(&self, argv: &Argv) -> i32;
     /// The sun parser's macro table (`pctxt->subst`), for program maps.
     fn subst(&self) -> Option<crate::libautofs::macros::Table> {
         None
     }
     /// `parse_mount()`.
-    fn mount(&mut self, _ap: &Arc<AutofsPoint>, _map: &Arc<MapSource>, _name: &[u8], _mapent: Option<&[u8]>) -> i32 {
+    fn mount(&self, _ap: &Arc<AutofsPoint>, _map: &Arc<MapSource>, _name: &[u8], _mapent: Option<&[u8]>) -> i32 {
         panic!("parse_mount isn't ported yet for this format (phase 2)");
     }
-    fn done(self: Box<Self>) -> i32;
+    fn done(&self) -> i32;
 }
 
 /// A mount module's entry points.
@@ -138,12 +148,7 @@ fn lookup_name(name: &[u8]) -> Option<&'static str> {
 }
 
 /// `open_lookup()`: `Ok(module)` or `Err(NSS_STATUS_UNKNOWN)`.
-pub fn open_lookup(
-    name: &[u8],
-    err_prefix: Option<&[u8]>,
-    mapfmt: Option<&[u8]>,
-    argv: &Argv,
-) -> Result<Box<dyn LookupMod>, i32> {
+pub fn open_lookup(name: &[u8], err_prefix: Option<&[u8]>, mapfmt: Option<&[u8]>, argv: &Argv) -> Result<Lookup, i32> {
     if cstr::eq(name, b"nisplus") {
         if let Some(p) = err_prefix {
             logerr!(
@@ -172,29 +177,29 @@ pub fn open_lookup(
             return Err(NSS_STATUS_UNKNOWN);
         }
     };
-    let m: Option<Box<dyn LookupMod>> = match which {
-        "file" => modules::lookup_file::lookup_init(mapfmt, argv).map(|m| Box::new(m) as Box<dyn LookupMod>),
-        "dir" => modules::lookup_dir::lookup_init(mapfmt, argv).map(|m| Box::new(m) as Box<dyn LookupMod>),
-        "program" => modules::lookup_program::lookup_init(mapfmt, argv).map(|m| Box::new(m) as Box<dyn LookupMod>),
+    let m: Option<Lookup> = match which {
+        "file" => modules::lookup_file::lookup_init(mapfmt, argv).map(|m| Arc::new(m) as Lookup),
+        "dir" => modules::lookup_dir::lookup_init(mapfmt, argv).map(|m| Arc::new(m) as Lookup),
+        "program" => modules::lookup_program::lookup_init(mapfmt, argv).map(|m| Arc::new(m) as Lookup),
         "yp" => modules::lookup_yp::lookup_init(mapfmt, argv).map(|_| unreachable!()),
-        "hosts" => modules::lookup_hosts::lookup_init(mapfmt, argv).map(|m| Box::new(m) as Box<dyn LookupMod>),
-        "userhome" => modules::lookup_userhome::lookup_init(mapfmt, argv).map(|m| Box::new(m) as Box<dyn LookupMod>),
-        "multi" => modules::lookup_multi::lookup_init(mapfmt, argv).map(|m| Box::new(m) as Box<dyn LookupMod>),
+        "hosts" => modules::lookup_hosts::lookup_init(mapfmt, argv).map(|m| Arc::new(m) as Lookup),
+        "userhome" => modules::lookup_userhome::lookup_init(mapfmt, argv).map(|m| Arc::new(m) as Lookup),
+        "multi" => modules::lookup_multi::lookup_init(mapfmt, argv).map(|m| Arc::new(m) as Lookup),
         other => unreachable!("lookup module {other} has no port"),
     };
     m.ok_or(NSS_STATUS_UNKNOWN)
 }
 
 /// `close_lookup()`.
-pub fn close_lookup(m: Box<dyn LookupMod>) -> i32 {
+pub fn close_lookup(m: Lookup) -> i32 {
     m.done()
 }
 
 /// `open_parse()`.
-pub fn open_parse(name: &[u8], err_prefix: Option<&[u8]>, argv: &Argv) -> Option<Box<dyn ParseMod>> {
+pub fn open_parse(name: &[u8], err_prefix: Option<&[u8]>, argv: &Argv) -> Option<Parse> {
     match cstr::c(name) {
-        b"sun" => modules::parse_sun::parse_init(argv).map(|m| Box::new(m) as Box<dyn ParseMod>),
-        b"amd" => modules::parse_amd::parse_init(argv).map(|m| Box::new(m) as Box<dyn ParseMod>),
+        b"sun" => modules::parse_sun::parse_init(argv).map(|m| Arc::new(m) as Parse),
+        b"amd" => modules::parse_amd::parse_init(argv).map(|m| Arc::new(m) as Parse),
         _ => {
             if let Some(p) = err_prefix {
                 logerr!(
@@ -212,7 +217,7 @@ pub fn open_parse(name: &[u8], err_prefix: Option<&[u8]>, argv: &Argv) -> Option
 }
 
 /// `reinit_parse()`.
-pub fn reinit_parse(m: &mut dyn ParseMod, name: &[u8], err_prefix: Option<&[u8]>, argv: &Argv) -> i32 {
+pub fn reinit_parse(m: &dyn ParseMod, name: &[u8], err_prefix: Option<&[u8]>, argv: &Argv) -> i32 {
     if m.reinit(argv) != 0 {
         if let Some(p) = err_prefix {
             logerr!("reinit_parse", "211", "{}could not reinit parse module {}", p, name);
@@ -223,7 +228,7 @@ pub fn reinit_parse(m: &mut dyn ParseMod, name: &[u8], err_prefix: Option<&[u8]>
 }
 
 /// `close_parse()`.
-pub fn close_parse(m: Box<dyn ParseMod>) -> i32 {
+pub fn close_parse(m: Parse) -> i32 {
     m.done()
 }
 
@@ -238,9 +243,10 @@ pub fn open_mount(name: &[u8], err_prefix: Option<&[u8]>) -> Option<Box<dyn Moun
         b"nfs" | b"nfs4" => modules::mount_nfs::mount_init().map(|m| Box::new(m) as Box<dyn MountMod>),
         b"bind" => modules::mount_bind::mount_init().map(|m| Box::new(m) as Box<dyn MountMod>),
         b"generic" => modules::mount_generic::mount_init().map(|m| Box::new(m) as Box<dyn MountMod>),
-        b"autofs" | b"ext2" | b"ext3" | b"ext4" | b"afs" | b"changer" => {
-            panic!("mount module {} isn't ported yet (phase 4)", String::from_utf8_lossy(name))
-        }
+        b"autofs" => modules::mount_autofs::mount_init().map(|m| Box::new(m) as Box<dyn MountMod>),
+        b"ext2" | b"ext3" | b"ext4" => modules::mount_ext2::mount_init().map(|m| Box::new(m) as Box<dyn MountMod>),
+        b"afs" => modules::mount_afs::mount_init().map(|m| Box::new(m) as Box<dyn MountMod>),
+        b"changer" => modules::mount_changer::mount_init().map(|m| Box::new(m) as Box<dyn MountMod>),
         _ => {
             if let Some(p) = err_prefix {
                 logerr!(

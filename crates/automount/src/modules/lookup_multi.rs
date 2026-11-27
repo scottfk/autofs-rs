@@ -28,12 +28,19 @@ const LKP_NOTSUP: i32 = 0x8000;
 #[derive(Debug)]
 struct ModuleInfo {
     argv: Argv,
-    module: Option<(Vec<u8>, Box<dyn LookupMod>)>,
+    module: Option<(Vec<u8>, module::Lookup)>,
 }
 
 #[derive(Debug)]
 pub struct LookupMulti {
-    m: Vec<ModuleInfo>,
+    m: std::sync::Mutex<Vec<ModuleInfo>>,
+}
+
+impl LookupMulti {
+    /// The maps' modules, in order (the lock isn't held while they're used).
+    fn modules(&self) -> Vec<module::Lookup> {
+        self.m.lock().unwrap().iter().map(|i| i.module.as_ref().expect("multi map module").1.clone()).collect()
+    }
 }
 
 /// `alloc_context()`: split the arguments at `--`.
@@ -53,12 +60,12 @@ fn alloc_context(argv: &Argv) -> Option<Vec<ModuleInfo>> {
     Some(m)
 }
 
-fn open(name: &[u8], fmt: Option<&[u8]>, argv: &Argv) -> Option<(Vec<u8>, Box<dyn LookupMod>)> {
+fn open(name: &[u8], fmt: Option<&[u8]>, argv: &Argv) -> Option<(Vec<u8>, module::Lookup)> {
     module::open_lookup(name, Some(MODPREFIX), fmt, argv).ok().map(|m| (cstr::c(name).to_vec(), m))
 }
 
 /// `nss_open_lookup()`.
-fn nss_open_lookup(format: Option<&[u8]>, argv: &mut Argv) -> Option<(Vec<u8>, Box<dyn LookupMod>)> {
+fn nss_open_lookup(format: Option<&[u8]>, argv: &mut Argv) -> Option<(Vec<u8>, module::Lookup)> {
     let a0 = argv.first().cloned().flatten()?;
     if a0.first() == Some(&b'/') {
         return open(b"file", format, argv);
@@ -133,23 +140,22 @@ pub fn lookup_init(mapfmt: Option<&[u8]>, argv: &Argv) -> Option<LookupMulti> {
             return None;
         }
     }
-    Some(LookupMulti { m })
+    Some(LookupMulti { m: std::sync::Mutex::new(m) })
 }
 
 impl LookupMod for LookupMulti {
-    fn reinit(&mut self, _mapfmt: Option<&[u8]>, _argv: &Argv) -> i32 {
+    fn reinit(&self, _mapfmt: Option<&[u8]>, _argv: &Argv) -> i32 {
         panic!("lookup(multi) reinit isn't ported yet (phase 3, map reloads)");
     }
 
-    fn read_master(&mut self, _master: &Arc<Master>, _age: i64) -> i32 {
+    fn read_master(&self, _master: &Arc<Master>, _age: i64) -> i32 {
         NSS_STATUS_UNKNOWN
     }
 
     /// `lookup_read_map()`.
-    fn read_map(&mut self, ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, age: i64) -> i32 {
+    fn read_map(&self, ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, age: i64) -> i32 {
         let mut at_least_1 = false;
-        for info in self.m.iter_mut() {
-            let (_, md) = info.module.as_mut().expect("multi map module");
+        for md in self.modules() {
             let ret = md.read_map(ap, map, age);
             if ret & LKP_FAIL != 0 || ret == LKP_NOTSUP {
                 continue;
@@ -160,9 +166,8 @@ impl LookupMod for LookupMulti {
     }
 
     /// `lookup_mount()`: the first map that mounts the key.
-    fn mount(&mut self, ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, name: &[u8]) -> i32 {
-        for info in self.m.iter_mut() {
-            let (_, md) = info.module.as_mut().expect("multi map module");
+    fn mount(&self, ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, name: &[u8]) -> i32 {
+        for md in self.modules() {
             if md.mount(ap, map, name) == 0 {
                 return NSS_STATUS_SUCCESS;
             }
@@ -171,9 +176,9 @@ impl LookupMod for LookupMulti {
     }
 
     /// `lookup_done()`.
-    fn done(self: Box<Self>) -> i32 {
+    fn done(&self) -> i32 {
         let mut rv = 0;
-        for info in self.m {
+        for info in std::mem::take(&mut *self.m.lock().unwrap()) {
             if let Some((_, md)) = info.module {
                 // rv = rv || close_lookup(): once one fails, the rest stay open.
                 if rv == 0 {

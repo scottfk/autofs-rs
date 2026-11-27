@@ -4,12 +4,12 @@
 //! as the map entry and its stderr logged (`>> ...`). An amd program map's
 //! program prints the key, then the entry.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::daemon::lookup;
 use crate::daemon::master::{AutofsPoint, MapSource, Master};
 use crate::daemon::master::{MAP_FLAG_FORMAT_AMD, MOUNT_FLAG_REMOUNT};
-use crate::daemon::module::{self, LookupMod, ParseMod};
+use crate::daemon::module::{self, LookupMod};
 use crate::libautofs::args::{self, Argv};
 use crate::libautofs::cache::CHE_UNAVAIL;
 use crate::libautofs::cstr;
@@ -24,16 +24,31 @@ const MODPREFIX: &[u8] = b"lookup(program): ";
 
 #[derive(Debug)]
 pub struct LookupProgram {
-    pub mapname: Vec<u8>,
-    pub mapfmt: Vec<u8>,
-    pub parse: Option<Box<dyn ParseMod>>,
+    mapname: Mutex<Vec<u8>>,
+    mapfmt: Mutex<Vec<u8>>,
+    parse: Mutex<Option<module::Parse>>,
+}
+
+impl LookupProgram {
+    fn mapname(&self) -> Vec<u8> {
+        self.mapname.lock().unwrap().clone()
+    }
+
+    fn mapfmt(&self) -> Vec<u8> {
+        self.mapfmt.lock().unwrap().clone()
+    }
+
+    /// The parse context (shared: the lock isn't held while it's used).
+    fn parse(&self) -> module::Parse {
+        self.parse.lock().unwrap().clone().expect("parse context")
+    }
 }
 
 /// `do_init()`.
 fn do_init(
     mapfmt: Option<&[u8]>,
     argv: &Argv,
-    parse: &mut Option<Box<dyn ParseMod>>,
+    parse: &mut Option<module::Parse>,
     reinit: bool,
 ) -> Option<(Vec<u8>, Vec<u8>)> {
     let Some(m) = args::arg(argv, 0) else {
@@ -51,8 +66,8 @@ fn do_init(
     let mapfmt = mapfmt.unwrap_or(b"sun").to_vec();
     let rest: Argv = argv[1..].to_vec();
     if reinit {
-        let p = parse.as_mut().expect("parse context");
-        if module::reinit_parse(p.as_mut(), &mapfmt, Some(MODPREFIX), &rest) != 0 {
+        let p = parse.as_ref().expect("parse context");
+        if module::reinit_parse(&**p, &mapfmt, Some(MODPREFIX), &rest) != 0 {
             logmsg!("lookup(program): failed to reinit parse context");
             return None;
         }
@@ -72,7 +87,7 @@ fn do_init(
 pub fn lookup_init(mapfmt: Option<&[u8]>, argv: &Argv) -> Option<LookupProgram> {
     let mut parse = None;
     let (mapname, mapfmt) = do_init(mapfmt, argv, &mut parse, false)?;
-    Some(LookupProgram { mapname, mapfmt, parse })
+    Some(LookupProgram { mapname: Mutex::new(mapname), mapfmt: Mutex::new(mapfmt), parse: Mutex::new(parse) })
 }
 
 impl LookupProgram {
@@ -100,8 +115,8 @@ impl LookupProgram {
         // The child's environment: macro_setenv() of the global table and the
         // parser's table with addstdenv() applied (sun maps only).
         let mut sets: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        if self.mapfmt == b"sun"
-            && let Some(mut subst) = self.parse.as_ref().and_then(|p| p.subst())
+        if self.mapfmt() == b"sun"
+            && let Some(mut subst) = self.parse.lock().unwrap().clone().and_then(|p| p.subst())
         {
             mounts::addstdenv(&mut subst, prefix);
             for sv in macros::global_table().iter().chain(subst.iter()) {
@@ -111,12 +126,12 @@ impl LookupProgram {
         let env = sys::environ_with(&sets);
         let path = ap.path();
         let chdir_msg = if log::have_log_verbose() || log::have_log_debug() || logopt != 0 {
-            bfmt!("lookup(program): failed to set PWD to {} for map {}", path, self.mapname)
+            bfmt!("lookup(program): failed to set PWD to {} for map {}", path, self.mapname())
         } else {
             Vec::new()
         };
         let f = sys::spawn_program(
-            &self.mapname,
+            &self.mapname(),
             name,
             &env,
             &path,
@@ -297,7 +312,7 @@ impl LookupProgram {
     }
 
     /// `lookup_mount()`.
-    fn mount_impl(&mut self, ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, name: &[u8]) -> i32 {
+    fn mount_impl(&self, ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, name: &[u8]) -> i32 {
         let source = map;
         let mc = source.mc();
         let logopt = ap.logopt();
@@ -333,9 +348,7 @@ impl LookupProgram {
                 );
                 let nt = ap.lock().negative_timeout as i64;
                 if cstr::strchr(name, b'/').is_some() || age + nt > sys::monotonic_time() {
-                    let mut parse = self.parse.take().expect("parse context");
-                    ret = parse.mount(ap, source, name, m.as_deref());
-                    self.parse = Some(parse);
+                    ret = self.parse().mount(ap, source, name, m.as_deref());
                     done = true;
                 } else {
                     if mm {
@@ -364,9 +377,7 @@ impl LookupProgram {
                 Err(r) => ret = r,
                 Ok(mapent) => {
                     debug!(logopt, "lookup_mount", "lookup(program): {} -> {}", name, mapent);
-                    let mut parse = self.parse.take().expect("parse context");
-                    ret = parse.mount(ap, source, name, Some(&mapent));
-                    self.parse = Some(parse);
+                    ret = self.parse().mount(ap, source, name, Some(&mapent));
                 }
             }
         }
@@ -383,31 +394,34 @@ impl LookupProgram {
 }
 
 impl LookupMod for LookupProgram {
-    fn mount(&mut self, ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, name: &[u8]) -> i32 {
+    fn mount(&self, ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, name: &[u8]) -> i32 {
         self.mount_impl(ap, map, name)
     }
 
-    fn reinit(&mut self, mapfmt: Option<&[u8]>, argv: &Argv) -> i32 {
-        match do_init(mapfmt, argv, &mut self.parse, true) {
+    fn reinit(&self, mapfmt: Option<&[u8]>, argv: &Argv) -> i32 {
+        let mut parse = self.parse.lock().unwrap().clone();
+        let r = do_init(mapfmt, argv, &mut parse, true);
+        *self.parse.lock().unwrap() = parse;
+        match r {
             Some((m, f)) => {
-                self.mapname = m;
-                self.mapfmt = f;
+                *self.mapname.lock().unwrap() = m;
+                *self.mapfmt.lock().unwrap() = f;
                 0
             }
             None => 1,
         }
     }
 
-    fn read_master(&mut self, _master: &Arc<Master>, _age: i64) -> i32 {
+    fn read_master(&self, _master: &Arc<Master>, _age: i64) -> i32 {
         NSS_STATUS_UNKNOWN
     }
 
-    fn read_map(&mut self, _ap: &Arc<AutofsPoint>, _map: &Arc<MapSource>, _age: i64) -> i32 {
+    fn read_map(&self, _ap: &Arc<AutofsPoint>, _map: &Arc<MapSource>, _age: i64) -> i32 {
         NSS_STATUS_UNKNOWN
     }
 
-    fn done(self: Box<Self>) -> i32 {
-        self.parse.map_or(0, module::close_parse)
+    fn done(&self) -> i32 {
+        self.parse.lock().unwrap().take().map_or(0, module::close_parse)
     }
 }
 
