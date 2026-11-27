@@ -848,6 +848,13 @@ pub struct SockAddr {
     raw: Vec<u8>,
 }
 
+impl SockAddr {
+    /// The whole `struct sockaddr_in`/`sockaddr_in6`.
+    pub fn raw(&self) -> &[u8] {
+        &self.raw
+    }
+}
+
 /// # Safety
 /// `sa` must be null or point to a socket address of its family's size.
 unsafe fn sockaddr_from(sa: *const libc::sockaddr) -> Option<SockAddr> {
@@ -878,6 +885,7 @@ unsafe fn sockaddr_from(sa: *const libc::sockaddr) -> Option<SockAddr> {
 pub struct AddrInfo {
     pub addr: SockAddr,
     pub canonname: Option<Vec<u8>>,
+    pub protocol: c_int,
 }
 
 /// `getaddrinfo(name, NULL, hints)`: the results, or the error code.
@@ -904,7 +912,7 @@ pub fn getaddrinfo(name: &[u8], family: c_int, socktype: c_int, flags: c_int) ->
                 Some(CStr::from_ptr((*p).ai_canonname).to_bytes().to_vec())
             };
             if let Some(addr) = sockaddr_from((*p).ai_addr) {
-                out.push(AddrInfo { addr, canonname: canon });
+                out.push(AddrInfo { addr, canonname: canon, protocol: (*p).ai_protocol });
             }
             p = (*p).ai_next;
         }
@@ -1440,4 +1448,63 @@ pub fn mount_flags_only(target: &[u8], flags: libc::c_ulong) -> i32 {
 pub fn random() -> i64 {
     // SAFETY: plain call.
     unsafe { libc::rand() as i64 }
+}
+
+/// `open_sock()` (daemon/spawn.c): a close-on-exec socket.
+pub fn open_sock(domain: c_int, ty: c_int, protocol: c_int) -> c_int {
+    // SAFETY: plain call.
+    let fd = unsafe { libc::socket(domain, ty | libc::SOCK_CLOEXEC, protocol) };
+    if fd == -1 {
+        let e = errno();
+        logerr!("open_sock", "181", "failed to open socket: {}", strerror(e));
+        set_errno(e);
+    }
+    fd
+}
+
+/// `getprotobynumber()`'s name.
+pub fn getprotobynumber(proto: c_int) -> Option<Vec<u8>> {
+    // SAFETY: the static result is copied at once (callers serialize).
+    unsafe {
+        let p = libc::getprotobynumber(proto);
+        if p.is_null() {
+            return None;
+        }
+        Some(CStr::from_ptr((*p).p_name).to_bytes().to_vec())
+    }
+}
+
+/// `getservbyname(name, proto)`'s port (network order).
+pub fn getservbyname(name: &[u8], proto: &[u8]) -> Option<u16> {
+    let (n, p) = (cstring(name), cstring(proto));
+    // SAFETY: valid strings; the static result is read at once.
+    unsafe {
+        let s = libc::getservbyname(n.as_ptr(), p.as_ptr());
+        if s.is_null() {
+            return None;
+        }
+        Some((*s).s_port as u16)
+    }
+}
+
+/// `getrpcbyname()`'s program number.
+pub fn getrpcbyname(name: &[u8]) -> Option<u32> {
+    #[repr(C)]
+    struct RpcEnt {
+        r_name: *mut libc::c_char,
+        r_aliases: *mut *mut libc::c_char,
+        r_number: c_int,
+    }
+    unsafe extern "C" {
+        fn getrpcbyname(name: *const libc::c_char) -> *mut RpcEnt;
+    }
+    let n = cstring(name);
+    // SAFETY: a valid string; the static result is read at once.
+    unsafe {
+        let r = getrpcbyname(n.as_ptr());
+        if r.is_null() {
+            return None;
+        }
+        Some((*r).r_number as u32)
+    }
 }

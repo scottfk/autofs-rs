@@ -202,9 +202,20 @@ fn check_nfs_mount_version() -> u32 {
         return u32::MAX;
     }
     const EBUFSIZ: usize = 1024;
+    // The buffer as C cuts it: lines end at a NUL where their newline was,
+    // and the version is looked for in it (a C string from the start) after
+    // every read, so a line just cut counts too.
     let mut errbuf = vec![0u8; EBUFSIZ + 1];
     let mut errp = 0usize;
     let mut found: Option<(u32, u32, u32)> = None;
+    let look = |buf: &[u8], found: &mut Option<(u32, u32, u32)>| {
+        let line = cstr::c(buf);
+        if let Some(at) = cstr::strstr(line, b"nfs-utils")
+            && let Some(v) = extract_version(&line[at..])
+        {
+            *found = Some(v);
+        }
+    };
     loop {
         let n = loop {
             let n = sys::read(pr, &mut errbuf[errp..EBUFSIZ]);
@@ -218,6 +229,7 @@ fn check_nfs_mount_version() -> u32 {
             let mut sp = 0;
             while errp > 0 {
                 let Some(nl) = errbuf[sp..sp + errp].iter().position(|&b| b == b'\n') else { break };
+                errbuf[sp + nl] = 0;
                 errp -= nl + 1;
                 sp += nl + 1;
             }
@@ -225,14 +237,12 @@ fn check_nfs_mount_version() -> u32 {
                 errbuf.copy_within(sp..sp + errp, 0);
             }
             if errp >= EBUFSIZ {
-                let line = cstr::c(&errbuf[..errp]).to_vec();
-                if let Some(at) = cstr::strstr(&line, b"nfs-utils")
-                    && let Some(v) = extract_version(&line[at..])
-                {
-                    found = Some(v);
-                }
+                // A line too long: split it.
+                errbuf[errp] = 0;
+                look(&errbuf, &mut found);
                 errp = 0;
             }
+            look(&errbuf, &mut found);
         }
         if n <= 0 {
             break;
@@ -240,12 +250,9 @@ fn check_nfs_mount_version() -> u32 {
     }
     sys::close(pr);
     if errp > 0 {
-        let line = cstr::c(&errbuf[..errp]).to_vec();
-        if let Some(at) = cstr::strstr(&line, b"nfs-utils")
-            && let Some(v) = extract_version(&line[at..])
-        {
-            found = Some(v);
-        }
+        // End of file without a newline.
+        errbuf[errp] = 0;
+        look(&errbuf, &mut found);
     }
     let mut ret = found.is_some() as u32;
     if let Some((maj, min, fix)) = found

@@ -2,6 +2,7 @@
 # 20261127 - Created by Claude (claude.ai, Anthropic) - scottfk
 # 20261127 - Time-limit the final tree listing so a dead daemon cannot hang a run - Claude - scottfk
 # 20261127 - Add restartd: kill the daemon with SIGKILL and start it again over its mounts - Claude - scottfk
+# 20261127 - A case with a net file gets a network namespace and fake NFS servers (net-setup.sh) - Claude - scottfk
 #
 # run-case.sh - run one daemon case on the root test VM (see tests/common/vm.rs)
 #
@@ -22,7 +23,9 @@ rm -rf "$C/out"
 mkdir -p "$C/out" "$C/ovl"
 [ -x "$B/real-mount" ] || cp /usr/bin/mount "$B/real-mount"
 [ -x "$B/real-umount" ] || cp /usr/bin/umount "$B/real-umount"
-exec unshare -m --propagation private sh -eu -c '
+NETNS=
+[ -f "$C/net" ] && NETNS=-n
+exec unshare -m $NETNS --propagation private sh -eu -c '
 B=$1; C=$2; IMPL=$3
 mount -t tmpfs tmpfs "$C/ovl"
 mkdir -p "$C/ovl/eu" "$C/ovl/ew" "$C/ovl/uu" "$C/ovl/uw" "$C/ovl/srv"
@@ -62,6 +65,7 @@ chmod 755 /usr/bin/mount /usr/bin/umount
 : > "$C/out/cmds"
 SRV=$C/ovl/srv
 export SRV
+[ -f "$C/net" ] && . "$B/net-setup.sh"
 [ -f "$C/pre" ] && . "$C/pre"
 # The daemon, in its own session: processes in its group see the raw mounts.
 set --
@@ -87,4 +91,5 @@ wait $PID
 echo "exit $?" > "$C/out/status"
 grep -E " /mnt" /proc/mounts | sed -E "s/(fd|pgrp|pipe_ino)=[0-9]+/\1=N/g" | sort > "$C/out/mounts-after"
 timeout 20 find /mnt /run | sort > "$C/out/tree-after"
+command -v net_down >/dev/null && net_down
 ' run-case "$B" "$C" "$IMPL"

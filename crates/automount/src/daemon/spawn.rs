@@ -11,7 +11,7 @@ const PATH_MOUNTED: &[u8] = b"/etc/mtab";
 const PROC_MOUNTS: &[u8] = b"/proc/mounts";
 const PROC_SELF_MOUNTS: &[u8] = b"/proc/self/mounts";
 const MTAB_NOTUPDATED: i32 = 0x1000;
-const MNT_FORCE_FAIL: i32 = -1;
+pub const MNT_FORCE_FAIL: i32 = -1;
 const MTAB_LOCK_RETRIES: u32 = 3;
 const ERRBUFSIZ: usize = 2047;
 
