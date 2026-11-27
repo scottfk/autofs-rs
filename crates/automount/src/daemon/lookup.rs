@@ -495,7 +495,7 @@ pub fn lookup_prune_one_cache(ap: &Arc<AutofsPoint>, mc: &Arc<crate::libautofs::
                 skip = true;
             } else if ty == LKP_INDIRECT {
                 // Offsets are managed by expire; a multi-mount's owner stays.
-                if e.key.first() == Some(&b'/') || (e.mm && !e.mm_nonroot) {
+                if e.key.first() == Some(&b'/') || e.is_mm_root() {
                     skip = true;
                 } else if flags & (MOUNT_FLAG_GHOST | MOUNT_FLAG_AMD_CACHE_ALL) == 0 {
                     // An unread map keeps entries for the positive timeout.
@@ -913,7 +913,7 @@ pub fn lookup_ghost(ap: &Arc<AutofsPoint>) -> u32 {
         while let Some(pos) = p {
             let (key, mapent, mm) = {
                 let e = c.get(pos);
-                (e.key.clone(), e.mapent.clone(), e.mm)
+                (e.key.clone(), e.mapent.clone(), e.is_mm())
             };
             let skip = match &mapent {
                 None => true,

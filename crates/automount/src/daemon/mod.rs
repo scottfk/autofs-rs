@@ -1,6 +1,7 @@
 //! autofs' `daemon/`: `automount` itself.
 
 pub mod automount;
+pub mod direct;
 pub mod flag;
 pub mod indirect;
 pub mod lookup;

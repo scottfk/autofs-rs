@@ -32,14 +32,15 @@ below), and so does this port.
 
 ## Status
 
-Phases 1 to 3 are done (phase 3 in PR #5). `--dumpmaps` works for every map type hydra's
+Phases 1 to 3 are done, and phase 4a is in PR #6. `--dumpmaps` works for every map type hydra's
 build has, keys are looked up as the daemon looks them up (sun and amd maps, file,
-program and `multi` maps), and the daemon runs indirect mounts: startup and
+program and `multi` maps), and the daemon runs indirect and direct mounts: startup and
 daemonizing, the master map with its amd sections, the kernel's mount and expire
 requests, browsing, the negative cache, expiry, `SIGHUP`/`SIGUSR1`/`SIGUSR2`/`SIGTERM`,
-`-l` through the command FIFO, and the ioctl fallback. Everything matches C, byte for byte
-in some 230 differential cases on the host and in 21 daemon cases run as root on the test
-VM. Next: phase 4 (direct mounts, multi-mounts and submounts).
+`-l` through the command FIFO, the ioctl fallback, and multi-mount entries with their
+offset triggers, in indirect and direct maps. Everything matches C, byte for byte in some
+230 differential cases on the host and in 32 daemon cases run as root on the test VM.
+Next: phase 4b (submounts, the other mount modules and restart over existing mounts).
 
 The plan and its status live in the [roadmap](#roadmap) below, which is updated as each
 step lands.
@@ -159,11 +160,17 @@ comes in two tiers:
    `SIGTERM` (shutdown, with and without busy mounts). Moved out: entries that mount
    through `mount_nfs` (no `-fstype`, local `:/path` ones included, which `mount_nfs` binds)
    to phase 5, with `replicated.c`.
-4. **Direct mounts, multi-mounts and nesting (planned):** direct maps, offset mounts
-   and multi-mount trees (hydra's `/net` program map answers with one: `/ host:/`), `mount_autofs` (nested `-fstype=autofs` submounts),
-   `mount_ext2` (with its `fsck` run), `mount_afs`, `mount_changer`, map reloads that add,
-   change or remove entries while mounts are in use, and restart over existing mounts
-   (`README.active-restart`; the reconnect code for indirect mounts is ported, untested).
+4. **Direct mounts, multi-mounts and nesting:** in two parts.
+   - **4a (in progress, PR #6):** direct maps (triggers, expiry, reloads that add and
+     remove entries, shutdown), offset mounts and multi-mount trees in indirect and direct
+     maps (nested offsets, quoted paths, duplicate offsets, `-hosts`-style entries without
+     a root), and the offset handling in the expire threads. hydra's `/net` program map
+     answers with a multi-mount of NFS mounts (`/ host:/`), so its end-to-end case waits
+     for `mount_nfs` in phase 5.
+   - **4b (planned):** `mount_autofs` (nested `-fstype=autofs` submounts), `mount_ext2`
+     (with its `fsck` run), `mount_afs`, `mount_changer`, and restart over existing mounts
+     (`README.active-restart`; the reconnect code for indirect, direct and offset mounts
+     is ported, untested).
 5. **NFS and RPC maps (planned):** the `tirpc` dependency; `-hosts` export lists
    (`MOUNTPROC_EXPORT`) and amd `type:=host` locations; `lookup_yp` (the YP client calls on `tirpc`, against fake
    `ypbind` and `ypserv`); `mount_nfs` and `replicated.c` (proximity, version and protocol

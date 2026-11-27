@@ -292,3 +292,153 @@ fn daemon_verbose_and_request_ids() {
             .steps("waitlog 'mounted indirect on'; quiet 0.3\ntrig /mnt/a/t; waitlog 'mounted /mnt/a/t'\ntrig /mnt/a/nope; quiet 1\n"),
     );
 }
+
+const DMAP: &str = "/mnt/d1 -fstype=tmpfs,size=1m :tmpfs\n/mnt/d2 -fstype=bind :/etc/autofs\n\
+                    /mnt/deep/er/d3 -fstype=tmpfs :tmpfs\n/mnt/bad -fstype=nosuchfs :/dev/null\n";
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_direct_basic() {
+    check_vm(VmCase::new("d_direct_basic", "/- /etc/autofs/auto.d\n").map("auto.d", DMAP).steps(
+        "waitlog 'mounted trigger /mnt/bad'; quiet 0.5\nsnap\n\
+                 trig /mnt/d1; waitlog 'mounted /mnt/d1'\ntrig /mnt/d2/; waitlog 'mounted /mnt/d2'\n\
+                 trig /mnt/deep/er/d3; waitlog 'mounted /mnt/deep/er/d3'\n\
+                 trig /mnt/bad; waitlog 'failed to mount /mnt/bad'\nsnap\n",
+    ));
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_direct_expire() {
+    check_vm(
+        VmCase::new("d_direct_expire", "/- /etc/autofs/auto.d --timeout=2\n")
+            .map("auto.d", DMAP)
+            .drop_lines(&EXPIRE_CYCLE)
+            .steps(
+                "waitlog 'mounted trigger /mnt/bad'; quiet 0.5\ntrig /mnt/d1; waitlog 'mounted /mnt/d1'\nsnap\n\
+                 waitlog 'expired /mnt/d1' 100; quiet 1.5\nsnap\n",
+            ),
+    );
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_direct_hup() {
+    check_vm(VmCase::new("d_direct_hup", "/- /etc/autofs/auto.d\n").map("auto.d", DMAP).steps(
+        "waitlog 'mounted trigger /mnt/bad'; quiet 0.5\ntrig /mnt/d1; waitlog 'mounted /mnt/d1'\n\
+                 printf '/mnt/d1 -fstype=tmpfs :tmpfs\\n/mnt/new -fstype=tmpfs :tmpfs\\n' > /etc/autofs/auto.d\n\
+                 quiet 2\nsig HUP; waitlog 'mounted trigger /mnt/new'; quiet 1\nsnap\n\
+                 trig /mnt/new; waitlog 'mounted /mnt/new'\nsnap\n",
+    ));
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_direct_shutdown() {
+    // A busy direct mount at shutdown, then the rest.
+    check_vm(VmCase::new("d_direct_shutdown", "/- /etc/autofs/auto.d\n").map("auto.d", DMAP).steps(
+        "waitlog 'mounted trigger /mnt/bad'; quiet 0.5\ntrig /mnt/d1; waitlog 'mounted /mnt/d1'\n\
+                 trig /mnt/d2/; waitlog 'mounted /mnt/d2'\nstopd\n",
+    ));
+}
+
+// `m` has `:/` locations: a `:tmpfs` there would swallow the rest of the
+// entry (chunklen() skips blanks until it has seen a `:/`). `odd` gives each
+// offset its own options; `noroot` has no root offset; `syn` has an offset
+// without a location; `bs` has an escaped blank in an offset path.
+const MDIR: &str = "/mnt/mm / -fstype=tmpfs :tmpfs /in -fstype=tmpfs :tmpfs /in/deeper -fstype=tmpfs :tmpfs\n";
+
+const MMAP: &str = "m -fstype=tmpfs / :/tmpfs /sub :/tmpfs /a/b -fstype=bind :/etc/autofs\n\
+                    odd / -fstype=tmpfs :tmpfs /sub -fstype=tmpfs :tmpfs\n\
+                    noroot /x -fstype=tmpfs :tmpfs /y -fstype=tmpfs :tmpfs\n\
+                    \"q\" -fstype=tmpfs \"/\" :tmpfs \"/sp ace\" :tmpfs\n\
+                    dup -fstype=tmpfs / :tmpfs /x :tmpfs /x :tmpfs\nsyn -fstype=tmpfs / :tmpfs /z\n\
+                    bs -fstype=tmpfs / :/t /a\\ b :/t /c :/t\n";
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_multi_indirect() {
+    check_vm(
+        VmCase::new("d_multi_ind", "/mnt/a /etc/autofs/auto.a\n")
+            .map("auto.a", MMAP)
+            .steps(
+                "ready\ntrig /mnt/a/m; waitlog 'mounted /mnt/a/m'; quiet 0.5\nsnap\n\
+                 trig /mnt/a/m/sub; waitlog 'mounted /mnt/a/m/sub'\ntrig /mnt/a/m/a/b/; waitlog 'mounted /mnt/a/m/a/b'\nsnap\n\
+                 trig /mnt/a/noroot; waitlog 'mounted /mnt/a/noroot'; quiet 0.5\ntrig /mnt/a/noroot/y; waitlog 'mounted /mnt/a/noroot/y'\n\
+                 trig /mnt/a/q; waitlog 'mounted /mnt/a/q'; quiet 0.5\ntrig '/mnt/a/q/sp ace'; waitlog 'mounted /mnt/a/q/sp ace'\n\
+                 trig /mnt/a/dup; waitlog '/mnt/a/dup'; quiet 0.5\ntrig /mnt/a/odd; waitlog 'mounted /mnt/a/odd'\n\
+                 trig /mnt/a/bs; waitlog 'mounted /mnt/a/bs'; quiet 0.5\ntrig '/mnt/a/bs/a b'; waitlog 'mounted /mnt/a/bs/a b'\ntrig /mnt/a/syn; waitlog '/mnt/a/syn'; quiet 0.5\nsnap\nstopd\n",
+            ),
+    );
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_multi_direct() {
+    check_vm(
+        VmCase::new("d_multi_dir", "/- /etc/autofs/auto.d\n")
+            .map("auto.d", MDIR)
+            .steps(
+                "waitlog 'mounted trigger /mnt/mm'; quiet 0.5\ntrig /mnt/mm; waitlog 'mounted /mnt/mm'; quiet 0.5\nsnap\n\
+                 trig /mnt/mm/in; waitlog 'mounted /mnt/mm/in'; quiet 0.5\ntrig /mnt/mm/in/deeper; waitlog 'mounted /mnt/mm/in/deeper'\n\
+                 snap\nstopd\n",
+            ),
+    );
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_multi_expire() {
+    check_vm(
+        VmCase::new("d_multi_expire", "/mnt/a /etc/autofs/auto.a --timeout=2\n")
+            .map("auto.a", MMAP)
+            .drop_lines(&EXPIRE_CYCLE)
+            .steps(
+                "ready\ntrig /mnt/a/m; waitlog 'mounted /mnt/a/m'; quiet 0.5\ntrig /mnt/a/m/sub; waitlog 'mounted /mnt/a/m/sub'\nsnap\n\
+                 waitlog 'expired /mnt/a/m' 100; quiet 1.5\nsnap\n",
+            ),
+    );
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_multi_busy_shutdown() {
+    check_vm(VmCase::new("d_multi_busy", "/mnt/a /etc/autofs/auto.a\n").map("auto.a", MMAP).steps(
+        "ready\ntrig /mnt/a/m; waitlog 'mounted /mnt/a/m'; quiet 0.5\ntrig /mnt/a/m/sub; waitlog 'mounted /mnt/a/m/sub'\n\
+         (cd /mnt/a/m/sub && sleep 4) &\nquiet 0.5\nsig TERM; waitlog 'autofs stopped' 100 x; note busy\nsnap\nwait\n",
+    ));
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_multi_forced_shutdown() {
+    check_vm(VmCase::new("d_multi_force", "/- /etc/autofs/auto.d\n").map("auto.d", MDIR).steps(
+        "waitlog 'mounted trigger /mnt/mm'; quiet 0.5\ntrig /mnt/mm; waitlog 'mounted /mnt/mm'; quiet 0.5\n\
+         trig /mnt/mm/in; waitlog 'mounted /mnt/mm/in'; quiet 0.5\n(cd /mnt/mm/in && sleep 3) &\nquiet 0.5\n\
+         sig USR2; waitlog 'autofs stopped' 100 x\nsnap\nwait\n",
+    ));
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_multi_direct_noroot_expire() {
+    // No root offset: the trigger keeps its descriptor so the tree expires.
+    check_vm(
+        VmCase::new("d_multi_nr", "/- /etc/autofs/auto.d --timeout=2\n")
+            .map("auto.d", "/mnt/nr /x -fstype=tmpfs :/t /y -fstype=tmpfs :/t\n")
+            .drop_lines(&EXPIRE_CYCLE)
+            .steps(
+                "waitlog 'mounted trigger /mnt/nr'; quiet 0.5\ntrig /mnt/nr; waitlog 'mounted /mnt/nr'; quiet 0.5\n\
+                 trig /mnt/nr/x; waitlog 'mounted /mnt/nr/x'\nsnap\nwaitlog 'umounted offset mount /mnt/nr/x' 100; quiet 2\nsnap\n",
+            ),
+    );
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_multi_forced_shutdown_indirect() {
+    check_vm(VmCase::new("d_multi_force_ind", "/mnt/a /etc/autofs/auto.a\n").map("auto.a", MMAP).steps(
+        "ready\ntrig /mnt/a/m; waitlog 'mounted /mnt/a/m'; quiet 0.5\ntrig /mnt/a/m/sub; waitlog 'mounted /mnt/a/m/sub'\n\
+         (cd /mnt/a/m/sub && sleep 3) &\nquiet 0.5\nsig USR2; waitlog 'autofs stopped' 100 x\nsnap\nwait\n",
+    ));
+}

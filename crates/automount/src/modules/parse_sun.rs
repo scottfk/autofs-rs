@@ -4,7 +4,8 @@
 //! last), and `parse_mount()` for plain entries: `$`/`&` expansion, the
 //! entry's options, the locations (replicated ones joined with spaces), and
 //! `sun_mount()`'s pseudo options (`fstype=`, `[no]strict`, `[no-]use-weight-only`)
-//! on the way to the mount module. Multi-mount entries come in phase 4.
+//! on the way to the mount module, and multi-mount entries, whose offsets go
+//! into the cache as a tree under the entry and get triggers of their own.
 
 use std::sync::Mutex;
 
@@ -19,7 +20,7 @@ use crate::libautofs::defaults;
 use crate::libautofs::log::{LOGOPT_ANY, LOGOPT_NONE};
 use crate::libautofs::macros::{self, Table};
 use crate::libautofs::mounts;
-use crate::libautofs::parse_subs::{check_colon, chunklen, dequote, skipspace, strmcmp};
+use crate::libautofs::parse_subs::{self, check_colon, chunklen, dequote, skipspace, strmcmp};
 
 const MODPREFIX: &[u8] = b"parse(sun): ";
 
@@ -525,8 +526,16 @@ impl ParseMod for ParseSun {
             warn!(logopt, "parse(sun): error: empty map entry");
             return 1;
         };
-        let _ = map;
-        let pmapent = {
+        let mc = map.mc();
+        // Offsets were expanded with their multi-mount: not again, so quoting
+        // stays the same.
+        let is_offset = name.first() == Some(&b'/') && {
+            let c = mc.lock();
+            c.lookup_distinct(name).is_some_and(|p| c.get(p).mm_nonroot())
+        };
+        let pmapent = if is_offset {
+            cstr::c(mapent).to_vec()
+        } else {
             let _l = macros::macro_lock();
             mounts::addstdenv(&mut self.subst, None);
             let e = expandsunent(mapent, name, &self.subst, self.slashify_colons);
@@ -583,7 +592,18 @@ impl ParseMod for ParseSun {
         );
         let rest = &pmapent[p.min(pmapent.len())..];
         if check_is_multi(rest) {
-            panic!("multi-mount entries aren't ported yet (phase 4)");
+            let o = options.clone().unwrap_or_default();
+            return self.parse_multi(ap, map, name, &pmapent, p, &o);
+        }
+        // An offset of a multi-mount was parsed with it, options and all:
+        // the rest is the location.
+        let is_mm = name.first() == Some(&b'/') && {
+            let c = mc.lock();
+            c.lookup_distinct(name).is_some_and(|q| c.get(q).is_mm())
+        };
+        if is_mm {
+            let o = options.clone().unwrap_or_default();
+            return self.mount_subtree(ap, &mc, name, Some(rest), &o);
         }
         let l = chunklen(rest, check_colon(rest));
         let Some(mut loc) = dequote(rest, l, logopt) else {
@@ -660,5 +680,426 @@ impl ParseMod for ParseSun {
             if g.1 == 0 { g.0.take() } else { None }
         };
         m.map_or(0, module::close_mount)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-mount entries.
+
+const LKP_MULTI: u32 = 0x0008;
+const MAPENT_MAX_LEN: usize = 16384;
+const PATH_MAX: usize = 4096;
+
+/// `span_space()`: the length of a path that may be quoted.
+fn span_space(s: &[u8], maxlen: usize) -> usize {
+    let at = |i: usize| s.get(i).copied().unwrap_or(0);
+    let (mut p, mut len) = (0usize, 0usize);
+    while at(p) != 0 && !cstr::isblank(at(p)) && len < maxlen {
+        if at(p) == b'"' {
+            // while (*p++ && len++ < maxlen) if (*p == '"') break;
+            loop {
+                let c = at(p);
+                p += 1;
+                if c == 0 {
+                    break;
+                }
+                let ok = len < maxlen;
+                len += 1;
+                if !ok {
+                    break;
+                }
+                if at(p) == b'"' {
+                    break;
+                }
+            }
+        } else if at(p) == b'\\' {
+            p += 2;
+            len += 2;
+            continue;
+        }
+        p += 1;
+        len += 1;
+    }
+    len
+}
+
+/// Whether `p` starts a location rather than an offset path.
+fn starts_location(s: &[u8], p: usize) -> bool {
+    let at = |i: usize| s.get(i).copied().unwrap_or(0);
+    (at(p) == b'"' && at(p + 1) != b'/') || (at(p) != b'"' && at(p) != b'/')
+}
+
+/// `parse_mapent()`: an offset's options (added to `g_options`) and its
+/// locations; how much was used, or `None` (C's 0).
+fn parse_mapent(ent: &[u8], g_options: &[u8], logopt: u32) -> Option<(usize, Vec<u8>, Option<Vec<u8>>)> {
+    let at = |i: usize| ent.get(i).copied().unwrap_or(0);
+    let mut p = 0usize;
+    let mut myoptions: Vec<u8> = cstr::c(g_options).to_vec();
+    // Local options are appended to the per-map ones.
+    if at(p) == b'-' {
+        loop {
+            let mut newopt = None;
+            p += parse_options(&ent[p..], &mut newopt, logopt);
+            match newopt {
+                Some(n) if cstr::strstr(&n, &myoptions).is_some() => myoptions = n,
+                Some(n) => match concat_options(Some(myoptions.clone()), Some(n)) {
+                    Some(t) => myoptions = t,
+                    None => myoptions = Vec::new(),
+                },
+                None => {}
+            }
+            p += skipspace(&ent[p.min(ent.len())..]);
+            if at(p) != b'-' {
+                break;
+            }
+        }
+    }
+    debug!(logopt, "parse_mapent", "parse(sun): gathered options: {}", myoptions);
+    let autofs_hosts = |o: &[u8]| cstr::strstr(o, b"fstype=autofs").is_some() && cstr::strstr(o, b"hosts").is_some();
+    let rest = &ent[p.min(ent.len())..];
+    let l = chunklen(rest, check_colon(rest));
+    let Some(mut loc) = dequote(rest, l, logopt) else {
+        if autofs_hosts(&myoptions) {
+            warn!(logopt, "parse(sun): possible missing location");
+            return None;
+        }
+        return Some((p, myoptions, None));
+    };
+    if rest.first() == Some(&b'/') {
+        warn!(logopt, "parse(sun): error location begins with \"/\"");
+        return None;
+    }
+    if !validate_location(logopt, &loc) {
+        return None;
+    }
+    debug!(logopt, "parse_mapent", "parse(sun): dequote(\"{}\") -> {}", &rest[..l.min(rest.len())], loc);
+    p += l;
+    p += skipspace(&ent[p.min(ent.len())..]);
+    while at(p) != 0 && starts_location(ent, p) {
+        let r = &ent[p..];
+        let l = chunklen(r, check_colon(r));
+        match dequote(r, l, logopt) {
+            None => {
+                if autofs_hosts(&myoptions) {
+                    warn!(logopt, "parse(sun): null location or out of memory");
+                    return None;
+                }
+            }
+            Some(chunk) => {
+                if r.first() == Some(&b'/') {
+                    warn!(logopt, "parse(sun): error location begins with \"/\"");
+                    return None;
+                }
+                if !validate_location(logopt, &chunk) {
+                    return None;
+                }
+                debug!(logopt, "parse_mapent", "parse(sun): dequote(\"{}\") -> {}", &r[..l.min(r.len())], chunk);
+                loc.push(b' ');
+                loc.extend_from_slice(&chunk);
+            }
+        }
+        p += l;
+        p += skipspace(&ent[p.min(ent.len())..]);
+    }
+    Some((p, myoptions, Some(loc)))
+}
+
+/// `update_offset_entry()`: cache an offset of the multi-mount `name`, and
+/// list it (shortest path first, near enough) for the tree.
+#[allow(clippy::too_many_arguments)]
+fn update_offset_entry(
+    ap: &Arc<AutofsPoint>,
+    mc: &Arc<crate::libautofs::cache::Cache>,
+    offsets: &mut Vec<u64>,
+    name: &[u8],
+    m_root: &[u8],
+    m_offset: &[u8],
+    myoptions: &[u8],
+    loc: Option<&[u8]>,
+    age: i64,
+) -> i32 {
+    use crate::libautofs::cache::{CHE_DUPLICATE, CHE_FAIL, CHE_OK};
+    let logopt = ap.logopt();
+    let m_offset = cstr::c(m_offset);
+    if loc.is_none_or(|l| l.is_empty()) {
+        // Only the internal hosts map may have no location.
+        let ty = ap.entry().maps().first().and_then(|m| m.ty());
+        if ty.as_deref().is_none_or(|t| !cstr::eq(t, b"hosts")) {
+            error!(
+                logopt,
+                "update_offset_entry",
+                "parse(sun): syntax error in offset {} -> {}",
+                m_offset,
+                loc.unwrap_or(b"(null)")
+            );
+            return CHE_FAIL;
+        }
+    }
+    if m_offset.is_empty() {
+        error!(
+            logopt,
+            "update_offset_entry",
+            "parse(sun): syntax error in offset {} -> {}",
+            m_offset,
+            loc.unwrap_or(b"(null)")
+        );
+        return CHE_FAIL;
+    }
+    // A trailing '/' causes pain.
+    let mut o_len = m_offset.len();
+    while o_len > 1 && m_offset[o_len - 1] == b'/' {
+        o_len -= 1;
+    }
+    let m_key_len = m_root.len() + o_len;
+    if m_key_len > PATH_MAX {
+        error!(logopt, "update_offset_entry", "parse(sun): multi mount key too long");
+        return CHE_FAIL;
+    }
+    let m_key = [m_root, &m_offset[..o_len]].concat();
+    let myoptions = cstr::c(myoptions);
+    let m_options_len = if myoptions.is_empty() { 0 } else { myoptions.len() + 2 };
+    let m_mapent_len = loc.map_or(0, |l| l.len());
+    if m_mapent_len + m_options_len > MAPENT_MAX_LEN {
+        error!(logopt, "update_offset_entry", "parse(sun): multi mount mapent too long");
+        return CHE_FAIL;
+    }
+    let mut m_mapent = Vec::new();
+    if !myoptions.is_empty() {
+        m_mapent.push(b'-');
+        m_mapent.extend_from_slice(myoptions);
+        if let Some(l) = loc {
+            m_mapent.push(b' ');
+            m_mapent.extend_from_slice(l);
+        }
+    } else if let Some(l) = loc {
+        m_mapent.extend_from_slice(l);
+    }
+    let ret = {
+        let mut c = mc.lock();
+        let ret = c.update_offset(logopt, name, &m_key, &m_mapent, age);
+        if let Some(p) = c.lookup_distinct(&m_key) {
+            let (id, len) = (c.get(p).id, c.get(p).key.len());
+            if !offsets.contains(&id) {
+                // list_for_each_prev(): before the first (from the end) that
+                // isn't longer, or at the end when that's the last.
+                let lens: Vec<usize> =
+                    offsets.iter().map(|o| c.by_id(*o).map(|q| c.get(q).key.len()).unwrap_or(0)).collect();
+                let mut placed = false;
+                for i in (0..offsets.len()).rev() {
+                    if len >= lens[i] {
+                        if i == offsets.len() - 1 {
+                            offsets.push(id);
+                        } else {
+                            offsets.insert(i, id);
+                        }
+                        placed = true;
+                        break;
+                    }
+                }
+                if !placed {
+                    offsets.insert(0, id);
+                }
+            }
+        }
+        ret
+    };
+    if ret == CHE_DUPLICATE {
+        warn!(logopt, "parse(sun): syntax error or duplicate offset {} -> {}", m_offset, loc.unwrap_or(b"(null)"));
+        CHE_OK
+    } else if ret == CHE_FAIL {
+        debug!(
+            logopt,
+            "update_offset_entry", "parse(sun): failed to update multi-mount offset {} -> {}", m_offset, m_mapent
+        );
+        ret
+    } else {
+        debug!(logopt, "update_offset_entry", "parse(sun): updated multi-mount offset {} -> {}", m_offset, m_mapent);
+        CHE_OK
+    }
+}
+
+/// `cleanup_offset_entries()`.
+fn cleanup_offset_entries(ap: &Arc<AutofsPoint>, mc: &Arc<crate::libautofs::cache::Cache>, offsets: &[u64]) {
+    let mut c = mc.lock();
+    for id in offsets {
+        let Some(p) = c.by_id(*id) else { continue };
+        let key = c.get(p).key.clone();
+        if c.delete(&key) != crate::libautofs::cache::CHE_OK {
+            crit!(ap.logopt(), "cleanup_offset_entries", "failed to delete offset {}", key);
+        }
+    }
+}
+
+impl ParseSun {
+    /// `mount_subtree()`: mount a multi-mount's root offset (or a nesting
+    /// point) and the offset triggers directly in it.
+    fn mount_subtree(
+        &self,
+        ap: &Arc<AutofsPoint>,
+        mc: &Arc<crate::libautofs::cache::Cache>,
+        name: &[u8],
+        loc: Option<&[u8]>,
+        options: &[u8],
+    ) -> i32 {
+        let logopt = ap.logopt();
+        let me = {
+            let c = mc.lock();
+            c.lookup_distinct(name).map(|p| (c.get(p).id, c.get(p).is_mm_root(), c.get(p).key.clone(), c.get(p).age))
+        };
+        let Some((id, is_root, key, age)) = me else { return 0 };
+        let mut rv = 0;
+        let mut ret = 0;
+        if is_root {
+            let Some(mut rkey) = mounts::mount_fullpath(PATH_MAX, &ap.path(), &key) else {
+                warn!(logopt, "path loo long");
+                mounts::tree_mapent_delete_offsets(ap, mc, name);
+                return 1;
+            };
+            rkey.push(b'/');
+            // Mount the root offset if there is one.
+            let ro = {
+                let c = mc.lock();
+                c.lookup_distinct(&rkey).map(|p| (c.get(p).age, c.get(p).mapent.clone()))
+            };
+            if let Some((ro_age, ro_mapent)) = ro
+                && ro_age == age
+            {
+                let Some((_, myoptions, ro_loc)) = parse_mapent(&ro_mapent.unwrap_or_default(), options, logopt) else {
+                    warn!(logopt, "parse(sun): failed to parse root offset");
+                    mounts::tree_mapent_delete_offsets(ap, mc, name);
+                    return 1;
+                };
+                rv = self.sun_mount(ap, &rkey, name, ro_loc.as_deref(), Some(&myoptions));
+            }
+            if rv <= 0 {
+                ret = mounts::tree_mapent_mount_offsets(ap, mc, id, true);
+                if ret == 0 {
+                    mounts::tree_mapent_cleanup_offsets(ap, mc, id);
+                    error!(logopt, "mount_subtree", "parse(sun): failed to mount offset triggers");
+                    mounts::tree_mapent_delete_offsets(ap, mc, name);
+                    return 1;
+                }
+            }
+        } else {
+            // Mounts at nesting points must work for their offsets to be mounted.
+            rv = self.sun_mount(ap, name, name, loc, Some(options));
+            if rv <= 0 {
+                ret = mounts::tree_mapent_mount_offsets(ap, mc, id, true);
+                if ret == 0 {
+                    mounts::tree_mapent_cleanup_offsets(ap, mc, id);
+                    error!(logopt, "mount_subtree", "parse(sun): failed to mount offset triggers");
+                    return 1;
+                }
+            }
+        }
+        // A strict mount failed.
+        if rv > 0 {
+            return rv;
+        }
+        // A nonstrict fail with a non-empty multi-mount is a success.
+        if rv < 0 && ret > 0 {
+            rv = 0;
+        }
+        rv
+    }
+
+    /// The multi-mount branch of `parse_mount()`: cache the entry's offsets,
+    /// build its tree and mount the top of it.
+    fn parse_multi(
+        &self,
+        ap: &Arc<AutofsPoint>,
+        source: &Arc<MapSource>,
+        name: &[u8],
+        pmapent: &[u8],
+        mut p: usize,
+        options: &[u8],
+    ) -> i32 {
+        use crate::libautofs::cache::CHE_OK;
+        let logopt = ap.logopt();
+        let mc = source.mc();
+        let mapent_len = pmapent.len() + 1;
+        let at = |i: usize| pmapent.get(i).copied().unwrap_or(0);
+        let Some(m_root) = mounts::mount_fullpath(PATH_MAX, &ap.path(), name) else {
+            error!(logopt, "parse_mount", "parse(sun): multi-mount root path too long");
+            return 1;
+        };
+        let age = {
+            let mut c = mc.lock();
+            let Some(mp) = c.lookup_distinct(name) else {
+                drop(c);
+                error!(logopt, "parse_mount", "parse(sun): can't find multi root {}", name);
+                return 1;
+            };
+            if !c.get(mp).is_mm() {
+                // So we know we're the multi-mount root.
+                mounts::tree_mapent_root(&mut c, mp);
+            } else if source.lock().flags & crate::daemon::master::MAP_FLAG_FORMAT_AMD != 0 {
+                // No multi-mount updates for amd mounts.
+                return 0;
+            }
+            c.get(mp).age
+        };
+        let mut offsets: Vec<u64> = Vec::new();
+        loop {
+            let (l, m_offset) = if starts_location(pmapent, p) {
+                let m = dequote(b"/", 1, logopt);
+                debug!(logopt, "parse_mount", "parse(sun): dequote(\"/\") -> {}", m.clone().unwrap_or_default());
+                (0, m)
+            } else {
+                let l = span_space(&pmapent[p..], mapent_len - p);
+                let m = parse_subs::sanitize_path(&pmapent[p..], l, LKP_MULTI, logopt);
+                debug!(
+                    logopt,
+                    "parse_mount",
+                    "parse(sun): dequote(\"{}\") -> {}",
+                    &pmapent[p..(p + l).min(pmapent.len())],
+                    crate::daemon::master::cstr_or_null(&m)
+                );
+                (l, m)
+            };
+            let Some(m_offset) = m_offset else {
+                warn!(logopt, "parse(sun): null path or out of memory");
+                cleanup_offset_entries(ap, &mc, &offsets);
+                return 1;
+            };
+            p += l;
+            p += skipspace(&pmapent[p.min(pmapent.len())..]);
+            let Some((l, myoptions, loc)) = parse_mapent(&pmapent[p.min(pmapent.len())..], options, logopt) else {
+                cleanup_offset_entries(ap, &mc, &offsets);
+                return 1;
+            };
+            if l == 0 {
+                cleanup_offset_entries(ap, &mc, &offsets);
+                return 1;
+            }
+            p += l;
+            p += skipspace(&pmapent[p.min(pmapent.len())..]);
+            let status =
+                update_offset_entry(ap, &mc, &mut offsets, name, &m_root, &m_offset, &myoptions, loc.as_deref(), age);
+            if status != CHE_OK {
+                warn!(logopt, "parse(sun): error adding multi-mount");
+                cleanup_offset_entries(ap, &mc, &offsets);
+                return 1;
+            }
+            if !(at(p) == b'/' || (at(p) == b'"' && at(p + 1) == b'/')) {
+                break;
+            }
+        }
+        {
+            let mut c = mc.lock();
+            let Some(mp) = c.lookup_distinct(name) else {
+                drop(c);
+                cleanup_offset_entries(ap, &mc, &offsets);
+                return 1;
+            };
+            let root = c.get(mp).mm_root.expect("multi-mount root");
+            for oe in &offsets {
+                if !mounts::tree_mapent_add_node(&mut c, root, *oe) {
+                    let k = c.by_id(*oe).map(|q| c.get(q).key.clone()).unwrap_or_default();
+                    error!(logopt, "parse_mount", "failed to add offset {} to tree", k);
+                }
+            }
+        }
+        self.mount_subtree(ap, &mc, name, None, options)
     }
 }

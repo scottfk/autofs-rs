@@ -1309,3 +1309,20 @@ pub fn send_map_update_request(ap: &Arc<AutofsPoint>) {
         state::st_add_task(ap, ST_READMAP);
     }
 }
+
+/// The map source (or instance) with this id among the point's maps: an
+/// entry's `me->source`.
+pub fn find_source(ap: &AutofsPoint, id: usize) -> Option<Arc<MapSource>> {
+    fn walk(list: &[Arc<MapSource>], id: usize) -> Option<Arc<MapSource>> {
+        for m in list {
+            if m.id == id {
+                return Some(m.clone());
+            }
+            if let Some(f) = walk(&m.instances(), id) {
+                return Some(f);
+            }
+        }
+        None
+    }
+    walk(&ap.entry().maps(), id)
+}
