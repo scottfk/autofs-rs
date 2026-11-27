@@ -1,8 +1,8 @@
 //! `modules/lookup_program.c`: executable maps. The program is run with the
 //! key as its argument and the standard macros in its environment (with an
 //! `AUTOFS_` prefix unless `force_standard_program_map_env`), its stdout read
-//! as the map entry and its stderr logged (`>> ...`). amd program maps come
-//! with the amd parser.
+//! as the map entry and its stderr logged (`>> ...`). An amd program map's
+//! program prints the key, then the entry.
 
 use std::sync::Arc;
 
@@ -227,6 +227,7 @@ impl LookupProgram {
                 }
             }
         }
+        remember_answer(&mapent);
         if !errbuf.is_empty() {
             logmsg!(">> {}", cstr::c(&errbuf));
         }
@@ -244,21 +245,55 @@ impl LookupProgram {
         Some(cstr::c(&mapent).to_vec())
     }
 
-    /// `match_key()` for sun maps.
-    fn match_key(&self, ap: &Arc<AutofsPoint>, source: &Arc<MapSource>, name: &[u8]) -> Result<Vec<u8>, i32> {
-        if source.lock().flags & MAP_FLAG_FORMAT_AMD != 0 {
-            panic!("amd program maps aren't ported yet (phase 2)");
-        }
-        match self.lookup_one(ap, name) {
-            Some(ment) => {
-                let ret = source.mc().lock().update(source.id, name, Some(&ment), sys::monotonic_time());
-                if ret == crate::libautofs::cache::CHE_FAIL {
-                    return Err(NSS_STATUS_UNAVAIL);
-                }
-                Ok(ment)
+    /// `lookup_amd_defaults()`: cache the program's `/defaults` entry.
+    fn lookup_amd_defaults(&self, ap: &Arc<AutofsPoint>, source: &Arc<MapSource>) -> i32 {
+        if let Some(ment) = self.lookup_one(ap, b"/defaults") {
+            let start = skip_key(&ment, 9);
+            let ret = source.mc().lock().update(source.id, b"/defaults", Some(&start), sys::monotonic_time());
+            if ret == crate::libautofs::cache::CHE_FAIL {
+                return NSS_STATUS_UNAVAIL;
             }
-            None => Err(NSS_STATUS_NOTFOUND),
         }
+        NSS_STATUS_SUCCESS
+    }
+
+    /// `match_key()`: run the program for the key and cache its answer. For an
+    /// amd map the program prints the key before its entry, and the
+    /// `/defaults` entry and successively shorter `prefix/*` keys are asked for
+    /// too.
+    fn match_key(&self, ap: &Arc<AutofsPoint>, source: &Arc<MapSource>, name: &[u8]) -> Result<Vec<u8>, i32> {
+        let logopt = ap.logopt();
+        let is_amd = source.lock().flags & MAP_FLAG_FORMAT_AMD != 0;
+        let update = |key: &[u8], ment: &[u8]| -> Result<Vec<u8>, i32> {
+            let ret = source.mc().lock().update(source.id, key, Some(ment), sys::monotonic_time());
+            if ret == crate::libautofs::cache::CHE_FAIL {
+                return Err(NSS_STATUS_UNAVAIL);
+            }
+            Ok(ment.to_vec())
+        };
+        if is_amd && self.lookup_amd_defaults(ap, source) != NSS_STATUS_SUCCESS {
+            warn!(logopt, "lookup(program): failed to save /defaults entry");
+        }
+        let mut lkp_key = cstr::c(name).to_vec();
+        if is_amd && let Some(p) = ap.lock().pref.clone() {
+            lkp_key = [cstr::c(&p), &lkp_key[..]].concat();
+        }
+        if let Some(ment) = self.lookup_one(ap, &lkp_key) {
+            let start = if is_amd { skip_key(&ment, lkp_key.len()) } else { ment };
+            return update(&lkp_key, &start);
+        }
+        if !is_amd {
+            return Err(NSS_STATUS_NOTFOUND);
+        }
+        while let Some(prefix) = cstr::strrchr(&lkp_key, b'/') {
+            lkp_key.truncate(prefix);
+            let m = [&lkp_key[..], b"/*"].concat();
+            if let Some(ment) = self.lookup_one(ap, &m) {
+                let start = skip_key(&ment, m.len());
+                return update(&m, &start);
+            }
+        }
+        Err(NSS_STATUS_NOTFOUND)
     }
 
     /// `lookup_mount()`.
@@ -364,4 +399,40 @@ impl LookupMod for LookupProgram {
     fn done(self: Box<Self>) -> i32 {
         self.parse.map_or(0, module::close_parse)
     }
+}
+
+const MAPENT_MAX_LEN: usize = 16384;
+
+/// `lookup_one()`'s answer buffer, `malloc(MAPENT_MAX_LEN + 1)`ed and freed for
+/// each run. glibc hands each run the chunk the last one freed, so the bytes
+/// past an answer's NUL are what longer answers left there.
+static ANSWER_BUF: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+fn remember_answer(mapent: &[u8]) {
+    let mut b = ANSWER_BUF.lock().unwrap();
+    if b.len() < mapent.len() + 1 {
+        b.resize((mapent.len() + 1).max(MAPENT_MAX_LEN + 1), 0);
+    }
+    b[..mapent.len()].copy_from_slice(mapent);
+    b[mapent.len()] = 0;
+}
+
+/// An amd program's answer past the key it repeats (`len` bytes) and blanks.
+///
+/// QUIRK: an answer shorter than the key is read past its end, into what a
+/// previous answer (in practice the `/defaults` one) left in the buffer.
+fn skip_key(ment: &[u8], len: usize) -> Vec<u8> {
+    if len <= ment.len() {
+        let mut i = len;
+        while i < ment.len() && cstr::isblank(ment[i]) {
+            i += 1;
+        }
+        return ment[i..].to_vec();
+    }
+    let b = ANSWER_BUF.lock().unwrap();
+    let mut i = len.min(b.len());
+    while i < b.len() && cstr::isblank(b[i]) {
+        i += 1;
+    }
+    cstr::c(&b[i..]).to_vec()
 }

@@ -24,5 +24,5 @@ pub fn lookup_init(_mapfmt: Option<&[u8]>, argv: &Argv) -> Option<LookupYp> {
         return None;
     }
     yp_get_default_domain()?;
-    panic!("lookup module yp isn't ported yet (phase 2)");
+    panic!("lookup module yp isn't ported yet (phase 5)");
 }

@@ -180,7 +180,7 @@ pub fn open_lookup(
         "hosts" => modules::lookup_hosts::lookup_init(mapfmt, argv).map(|m| Box::new(m) as Box<dyn LookupMod>),
         "userhome" => modules::lookup_userhome::lookup_init(mapfmt, argv).map(|m| Box::new(m) as Box<dyn LookupMod>),
         "multi" => modules::lookup_multi::lookup_init(mapfmt, argv).map(|m| Box::new(m) as Box<dyn LookupMod>),
-        other => panic!("lookup module {other} isn't ported yet (phase 2)"),
+        other => unreachable!("lookup module {other} has no port"),
     };
     m.ok_or(NSS_STATUS_UNKNOWN)
 }

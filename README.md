@@ -32,13 +32,14 @@ below), and so does this port.
 
 ## Status
 
-Phases 1 and 2 are done (phase 2 in PR #3): `--dumpmaps` works for every map type
+Phases 1, 2 and 2b are done (2b in PR #4): `--dumpmaps` works for every map type
 hydra's build has (file, dir, program, `multi`, `-hosts`, amd maps; NIS+ fails as it does
 on hydra), and keys are looked up as the daemon looks them up (file, program and `multi`
-maps, the sun parser for plain entries, includes, nsswitch sources, the negative cache,
-browse directories), all matching C byte for byte in nearly 200 differential cases. The
-lookups are tested through a driver that runs the reference daemon's own code, with
-recording mount modules. Next: phase 2b (amd maps), then phase 3 (the daemon).
+maps, the sun parser for plain entries, the amd parser with its selectors, defaults and
+mount types, includes, nsswitch sources, the negative cache, browse directories), all
+matching C byte for byte in some 230 differential cases. The lookups are tested through a
+driver that runs the reference daemon's own code, with recording mount modules. Next:
+phase 3 (the daemon).
 
 The plan and its status live in the [roadmap](#roadmap) below, which is updated as each
 step lands.
@@ -138,12 +139,15 @@ comes in two tiers:
    Moved out: multi-mount entries to phase 4 (hydra's `/net` program map answers with
    one, and so does every `-hosts` lookup), `-hosts` export lists and NIS to phase 5 (they
    need the RPC client, and hydra uses neither).
-2b. **amd maps (planned):** `parse_amd` with the amd grammar, selectors and macros,
-   amd key matching (`/defaults`, wildcard prefixes) in the file and program maps, and
-   amd mount types, through the same drivers.
+2b. **amd maps (done, PR #4):** the amd scanner and grammar, `parse_amd` (selectors,
+   `/defaults` and `map_defaults`, `-`/`||` locations, `${...}` expansion, option merging,
+   the `auto`, `link`, `linkx`, `nfs`, `nfsl`, `lofs`, `ext`, `xfs`, `ufs`, `cdfs` and
+   `program` mount types), amd key matching (`/defaults`, `prefix/*` keys) in the file
+   and program maps, network proximity, and external mounts. Moved out: `type:=host`
+   locations to phase 5 (they mount through the hosts map).
 3. **The daemon, indirect mounts (planned):** startup (the pid file, daemonizing, the
    running check, `-F`/`-U`, `-f`, `-t`, `-n`/`-P`, `-M`, `-O`, `-D`, `-r`), the master
-   map at boot, `/dev/autofs` and the ioctl fallback, `-l`/`--set-log-priority` and the
+   map at boot (with the amd mount sections of `autofs.conf`), `/dev/autofs` and the ioctl fallback, `-l`/`--set-log-priority` and the
    command FIFO, the kernel packet pipe, the state machine and its queue, indirect
    mounts with `browse_mode` on and off, `spawn.c`'s
    `mount`/`umount` calls, `mount_generic` and `mount_bind`, negative caching, expiry on
@@ -155,7 +159,7 @@ comes in two tiers:
    change or remove entries while mounts are in use, and restart over existing mounts
    (`README.active-restart`).
 5. **NFS and RPC maps (planned):** the `tirpc` dependency; `-hosts` export lists
-   (`MOUNTPROC_EXPORT`); `lookup_yp` (the YP client calls on `tirpc`, against fake
+   (`MOUNTPROC_EXPORT`) and amd `type:=host` locations; `lookup_yp` (the YP client calls on `tirpc`, against fake
    `ypbind` and `ypserv`); `mount_nfs` and `replicated.c` (proximity, version and protocol
    probing with `NULL` pings and portmap lookups, weights, `-r` random selection,
    `mount_nfs_default_protocol`, `nfs_mount_uses_string_options`, fallback when a
