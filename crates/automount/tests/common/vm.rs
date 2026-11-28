@@ -121,6 +121,9 @@ pub struct VmCase {
     /// The fake NFS servers (`fake-nfsd`'s configuration; see net-setup.sh):
     /// the case then gets a network of its own.
     pub net: String,
+    /// Files in the case directory (path relative to it, contents): ypserv
+    /// maps (`yp/DOMAIN/MAP`), `var/` (laid over `/var`) and `domain`.
+    pub files: Vec<(String, Vec<u8>)>,
 }
 
 impl VmCase {
@@ -141,7 +144,18 @@ impl VmCase {
             drop_lines: Vec::new(),
             unordered_log: false,
             net: String::new(),
+            files: Vec::new(),
         }
+    }
+
+    pub fn file(mut self, path: &str, contents: &[u8]) -> VmCase {
+        self.files.push((path.into(), contents.to_vec()));
+        self
+    }
+
+    /// The NIS domain name (`(none)` without one).
+    pub fn domain(self, d: &str) -> VmCase {
+        self.file("domain", format!("{d}\n").as_bytes())
     }
 
     pub fn net(mut self, conf: &str) -> VmCase {
@@ -343,6 +357,11 @@ pub fn run_vm(case: &VmCase, imp: &str) -> VmOutcome {
     std::fs::write(dir.join("case/pre"), &case.pre).unwrap();
     if !case.net.is_empty() {
         std::fs::write(dir.join("case/net"), &case.net).unwrap();
+    }
+    for (p, c) in &case.files {
+        let f = dir.join("case").join(p);
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, c).unwrap();
     }
     let input = tar_of(&dir.join("case"), &["."]);
     // Both runs use the same directory, so paths in the outputs match.

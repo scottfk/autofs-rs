@@ -16,6 +16,7 @@ pub mod mounts;
 pub mod nsswitch;
 pub mod parse_subs;
 pub mod rpc_subs;
+pub mod yp;
 
 /// Something [`bfmt!`] can print.
 pub trait Piece {

@@ -181,7 +181,7 @@ pub fn open_lookup(name: &[u8], err_prefix: Option<&[u8]>, mapfmt: Option<&[u8]>
         "file" => modules::lookup_file::lookup_init(mapfmt, argv).map(|m| Arc::new(m) as Lookup),
         "dir" => modules::lookup_dir::lookup_init(mapfmt, argv).map(|m| Arc::new(m) as Lookup),
         "program" => modules::lookup_program::lookup_init(mapfmt, argv).map(|m| Arc::new(m) as Lookup),
-        "yp" => modules::lookup_yp::lookup_init(mapfmt, argv).map(|_| unreachable!()),
+        "yp" => modules::lookup_yp::lookup_init(mapfmt, argv).map(|m| Arc::new(m) as Lookup),
         "hosts" => modules::lookup_hosts::lookup_init(mapfmt, argv).map(|m| Arc::new(m) as Lookup),
         "userhome" => modules::lookup_userhome::lookup_init(mapfmt, argv).map(|m| Arc::new(m) as Lookup),
         "multi" => modules::lookup_multi::lookup_init(mapfmt, argv).map(|m| Arc::new(m) as Lookup),

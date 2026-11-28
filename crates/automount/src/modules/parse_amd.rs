@@ -24,10 +24,11 @@ use std::sync::{Arc, Mutex};
 
 use crate::daemon::automount::rmdir_path;
 use crate::daemon::lookup;
-use crate::daemon::master::{AutofsPoint, MapSource, cstr_or_null};
+use crate::daemon::master::{self, AutofsPoint, MapSource, cstr_or_null};
 use crate::daemon::module::{self, MountMod, ParseMod};
 use crate::daemon::mount::do_mount;
 use crate::daemon::spawn;
+use crate::daemon::state;
 use crate::libautofs::args::Argv;
 use crate::libautofs::cstr;
 use crate::libautofs::defaults::{self, CONF_AUTOFS_USE_LOFS, CONF_DOMAIN_STRIP, CONF_NORMALIZE_HOSTNAMES};
@@ -980,8 +981,98 @@ fn validate_program_options(logopt: u32, entry: &AmdEntry) -> bool {
     true
 }
 
+/// `wait_for_expire()`: wait out an expire; false if the autofs point is
+/// shutting down.
+fn wait_for_expire(ap: &Arc<AutofsPoint>) -> bool {
+    state::st_wait_task(ap, state::ST_EXPIRE, 0);
+    state::st_mutex_lock();
+    let st = ap.lock().state;
+    state::st_mutex_unlock();
+    st != state::ST_SHUTDOWN && st != state::ST_SHUTDOWN_PENDING && st != state::ST_SHUTDOWN_FORCE
+}
+
+/// `do_host_mount()`: the host's exports, through an instance of the hosts
+/// map, under the autofs point; a key other than the host's name becomes a
+/// symlink to it.
+fn do_host_mount(ap: &Arc<AutofsPoint>, name: &[u8], entry: &mut AmdEntry, source: &Arc<MapSource>) -> i32 {
+    let logopt = ap.logopt();
+    let rhost = s(&entry.rhost);
+    let mut mnt: Option<Vec<u8>> = None;
+    let mut ret = 1;
+    'out: {
+        // A mount point name that isn't the host's: point entry.path at the
+        // base of the host's mount tree (lookup_nss_mount() finds it there)
+        // and symlink to it after the mount.
+        if !cstr::eq(name, &rhost) {
+            entry.path = Some(bfmt!("{}/{}", ap.path(), rhost));
+            // An mnt_list entry for the updated path.
+            match mounts::mnts_add_amdmount(entry) {
+                Some(mp) => mnt = Some(mp),
+                None => {
+                    error!(logopt, "do_host_mount", "parse(amd): failed to update mount mnt_list entry");
+                    break 'out;
+                }
+            }
+            // Wait for any expire before racing to mount the export tree, or
+            // bail out if shutting down.
+            if !wait_for_expire(ap) {
+                break 'out;
+            }
+        }
+        let argv: Argv = match entry.opts.as_deref() {
+            Some(o) if !o.is_empty() => vec![Some(o.to_vec())],
+            _ => Vec::new(),
+        };
+        let pargv = if argv.is_empty() { None } else { Some(&argv) };
+        let instance = match master::master_find_source_instance(source, Some(b"hosts"), Some(b"sun"), pargv) {
+            Some(i) => i,
+            None => {
+                master::master_add_source_instance(source, Some(b"hosts"), Some(b"sun"), sys::monotonic_time(), &argv)
+            }
+        };
+        if instance.lock().lookup.is_none() {
+            match module::open_lookup(b"hosts", Some(MODPREFIX), None, &argv) {
+                Ok(l) => instance.lock().lookup = Some(l),
+                Err(_) => {
+                    debug!(logopt, "do_host_mount", "open lookup module hosts failed");
+                    break 'out;
+                }
+            }
+        }
+        {
+            let mc = source.mc();
+            let mut c = mc.lock();
+            if let Some(p) = c.lookup_distinct(name) {
+                c.push_mapent(p, None);
+            }
+        }
+        let l = instance.lock().lookup.clone().unwrap();
+        ret = l.mount(ap, &instance, &rhost);
+        if cstr::eq(name, &rhost) {
+            break 'out;
+        }
+        let path = s(&entry.path);
+        if do_mount(ap, &ap.path(), name, Some(&path), b"bind", Some(b"symlink")) != 0 {
+            warn!(logopt, "parse(amd): failed to create symlink to hosts mount base");
+        }
+    }
+    if ret != 0
+        && let Some(mp) = mnt
+    {
+        mounts::mnts_remove_amdmount(&mp);
+    }
+    ret
+}
+
 /// `amd_mount()`: mount one location by its type.
-fn amd_mount(ap: &Arc<AutofsPoint>, name: &[u8], entry: &mut AmdEntry, sv: &Table, flags: u64) -> i32 {
+fn amd_mount(
+    ap: &Arc<AutofsPoint>,
+    name: &[u8],
+    entry: &mut AmdEntry,
+    source: &Arc<MapSource>,
+    sv: &Table,
+    flags: u64,
+) -> i32 {
     let logopt = ap.logopt();
     let fstype = entry.flags & AMD_MOUNT_TYPE_MASK;
     match fstype {
@@ -1036,7 +1127,7 @@ fn amd_mount(ap: &Arc<AutofsPoint>, name: &[u8], entry: &mut AmdEntry, sv: &Tabl
             if !validate_host_options(logopt, entry) {
                 return 1;
             }
-            panic!("amd host mounts aren't ported yet (phase 5, with the hosts map)");
+            do_host_mount(ap, name, entry, source)
         }
         AMD_MOUNT_TYPE_PROGRAM => {
             if !validate_program_options(logopt, entry) {
@@ -1310,7 +1401,7 @@ impl ParseAmd {
                 error!(logopt, "parse_mount", "parse(amd): failed to add mount to mnt_list");
                 break;
             };
-            rv = amd_mount(ap, name, &mut this, &sv, flags);
+            rv = amd_mount(ap, name, &mut this, source, &sv, flags);
             if rv == 0 {
                 if !cstr::eq(&s(&this.path), &mnt_mp) {
                     mounts::mnts_add_mount(ap, &s(&this.rhost), MNTS_INDIRECT | MNTS_MOUNTED);
