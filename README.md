@@ -32,7 +32,7 @@ below), and so does this port.
 
 ## Status
 
-Phases 1 to 5a are done, and phase 5b is in PR #9. `--dumpmaps` works for every map type
+Phases 1 to 5 are done, and phase 6a (hostile input on the host) is in PR #10. `--dumpmaps` works for every map type
 hydra's build has, keys are looked up as the daemon looks them up (sun and amd maps; file,
 program, `multi`, `-hosts` and NIS maps), and the daemon runs indirect and direct mounts: startup
 and daemonizing, the master map with its amd sections, the kernel's mount and expire
@@ -42,9 +42,11 @@ triggers, submounts (`-fstype=autofs`), restart over existing mounts, and every 
 module, NFS included: replicated locations, proximity, and the probe that picks the
 servers (hydra's `/net` map works end to end), `-hosts` maps and amd `type:=host`
 locations (the mount daemon's export lists), and NIS maps (libnsl's YP client, bound
-through binding files or ypbind). Everything matches C, byte for byte in some 230
-differential cases on the host and in 55 daemon cases run as root on the test VM, and a
-rehearsal against a real NFS server on the second test VM. Next: phase 6 (hostile input).
+through binding files or ypbind). Everything matches C, byte for byte in some 300
+differential cases on the host (malformed, huge and garbage maps and configuration files,
+hostile keys and program maps among them) and in 55 daemon cases run as root on the test
+VM, and a rehearsal against a real NFS server on the second test VM. Next: phase 6b
+(hostile input on the VM).
 
 The plan and its status live in the [roadmap](#roadmap) below, which is updated as each
 step lands.
@@ -198,10 +200,19 @@ comes in two tiers:
      mounts, a reload, a replicated entry with a dead host: the same mounts and log as
      C). Found: a reload of a browsable `-hosts` map with a host mounted crashes C
      (QUIRKS.md).
-6. **Hostile input (planned):** malformed and huge maps, program maps that hang, flood
-   or emit garbage, hostile keys (path tricks, overlong, odd characters) from processes
-   walking into a mount point, hostile `MOUNTPROC_EXPORT`, NIS and ping replies, kernel
-   packets racing with expiry and shutdown, and descriptor or thread exhaustion.
+6. **Hostile input:** in two parts.
+   - **6a (done, PR #10):** on the host tier (`diff_hostile.rs`): malformed, huge
+     (50000 entries, lines past `MAPENT_MAX_LEN`, keys past `KEY_MAX_LEN`) and garbage
+     file, amd and master maps, include loops and chains past `MAX_INCLUDE_DEPTH`,
+     `autofs.conf` and `nsswitch.conf` garbage, config files and maps that are
+     directories, macro, option and multi-mount expansion edges, hostile keys (path
+     tricks, overlong, shell and format characters) through sun, amd and program maps,
+     and program maps that flood, stall, emit garbage, close their output or die.
+     Found: a program map with output on both pipes hangs the lookup for good, and an
+     `nsswitch.conf` that is a directory makes C exit (QUIRKS.md).
+   - **6b (planned):** on the VM: hostile keys from processes walking into a mount
+     point, hostile `MOUNTPROC_EXPORT`, NIS and ping replies, kernel packets racing with
+     expiry and shutdown, and descriptor or thread exhaustion.
 7. **Packaging (planned):** a Gentoo ebuild in localrepo, rehearsed on the test VMs (the
    `/net` program map against a real NFS server, reloads, expiry, a server going away)
    with rpcbind-rs and nfs-utils-rs, then rolled back through a binary package of the C

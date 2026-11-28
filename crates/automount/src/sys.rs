@@ -253,6 +253,17 @@ pub fn read_file(path: &[u8]) -> Result<Vec<u8>, i32> {
     std::fs::read(p).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
 }
 
+/// `fopen(path, "r")` and read it all: `Err(errno)` if the open fails,
+/// `Ok(Err(errno))` if the open works and the read doesn't (a directory).
+pub fn open_read_file(path: &[u8]) -> Result<Result<Vec<u8>, i32>, i32> {
+    use std::io::Read;
+    use std::os::unix::ffi::OsStrExt;
+    let p = std::ffi::OsStr::from_bytes(super::libautofs::cstr::c(path));
+    let mut f = std::fs::File::open(p).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+    let mut data = Vec::new();
+    Ok(f.read_to_end(&mut data).map(|_| data).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO)))
+}
+
 unsafe extern "C" {
     fn strverscmp(a: *const c_char, b: *const c_char) -> c_int;
     fn srandom(seed: libc::c_uint);
