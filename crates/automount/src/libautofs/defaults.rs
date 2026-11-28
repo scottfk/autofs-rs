@@ -360,7 +360,7 @@ impl ConfCache {
     }
 
     /// `read_config()`.
-    fn read_config(&mut self, to_syslog: bool, data: &[u8]) {
+    fn read_config(&mut self, to_syslog: bool, (data, err): &(Vec<u8>, bool), name: &[u8]) {
         let mut new_sec: Option<Vec<u8>> = None;
         for raw in fgets_chunks(data, MAX_LINE_LEN + 1) {
             let mut line = raw.clone();
@@ -427,6 +427,10 @@ impl ConfCache {
                     self.check_set_config_value(new_sec.as_deref(), &key, &value);
                 }
             }
+        }
+        if *err {
+            // glibc's ferror() is 1.
+            message(to_syslog, &bfmt!("fgets returned error 1 while reading config {}", name));
         }
     }
 
@@ -554,9 +558,12 @@ fn parse_line(line: &mut [u8]) -> Option<Parsed> {
 }
 
 /// `open_fopen_r()` and read the whole file, logging as it does on failure.
-fn open_read(path: &[u8]) -> Option<Vec<u8>> {
-    match sys::read_file(path) {
-        Ok(d) => Some(d),
+/// A file that opens but can't be read (a directory) is `(empty, true)`:
+/// `fgets()` fails at once and `ferror()` is set.
+fn open_read(path: &[u8]) -> Option<(Vec<u8>, bool)> {
+    match sys::open_read_file(path) {
+        Ok(Ok(d)) => Some((d, false)),
+        Ok(Err(_)) => Some((Vec::new(), true)),
         Err(e) => {
             logerr!("open_fopen_r", "211", "failed to open file: {}", sys::strerror(e));
             None
@@ -586,7 +593,7 @@ pub fn defaults_read_config(to_syslog: bool) -> bool {
     }
     let _ = config.modified;
     if let Some(c) = &conf {
-        config.read_config(to_syslog, c);
+        config.read_config(to_syslog, c, DEFAULT_CONFIG_FILE);
     }
     if let Some(o) = &oldconf {
         let search_base = config.save_ldap_option_list(NAME_SEARCH_BASE);
@@ -597,7 +604,7 @@ pub fn defaults_read_config(to_syslog: bool) -> bool {
         if !uris.is_empty() {
             config.clean_ldap_multi_option(NAME_LDAP_URI);
         }
-        config.read_config(to_syslog, o);
+        config.read_config(to_syslog, o, OLD_CONFIG_FILE);
         if !search_base.is_empty() && config.lookup(AMD_GBL_SEC, NAME_SEARCH_BASE).is_none() {
             config.restore_ldap_option_list(search_base);
         }

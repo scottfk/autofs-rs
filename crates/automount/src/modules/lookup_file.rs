@@ -110,6 +110,8 @@ struct Stream {
     data: Vec<u8>,
     pos: usize,
     eof: bool,
+    /// `ferror()`: the file opened but reading it failed (a directory).
+    err: bool,
 }
 
 impl Stream {
@@ -118,7 +120,9 @@ impl Stream {
             self.pos += 1;
             self.data[self.pos - 1] as i32
         } else {
-            self.eof = true;
+            if !self.err {
+                self.eof = true;
+            }
             EOF
         }
     }
@@ -384,9 +388,11 @@ fn read_one(logopt: u32, f: &mut Stream) -> Option<(Vec<u8>, Vec<u8>)> {
 }
 
 /// `open_fopen_r()` on a map file, with its failure message; `Err(errno)`.
+/// A file that opens but can't be read (a directory) reads as `ferror()`.
 fn open_map(path: &[u8]) -> Result<Stream, i32> {
-    match sys::read_file(path) {
-        Ok(data) => Ok(Stream { data, pos: 0, eof: false }),
+    match sys::open_read_file(path) {
+        Ok(Ok(data)) => Ok(Stream { data, pos: 0, eof: false, err: false }),
+        Ok(Err(_)) => Ok(Stream { data: Vec::new(), pos: 0, eof: false, err: true }),
         Err(e) => {
             logerr!("open_fopen_r", "211", "failed to open file: {}", sys::strerror(e));
             Err(e)
@@ -533,6 +539,10 @@ impl LookupFile {
             if f.eof {
                 break;
             }
+            if f.err {
+                warn!(logopt, "lookup(file): error reading map {}", self.mapname());
+                break;
+            }
         }
         CHE_MISSING
     }
@@ -555,6 +565,10 @@ impl LookupFile {
                 return source.mc().lock().update(source.id, b"*", Some(&mapent), age);
             }
             if f.eof {
+                break;
+            }
+            if f.err {
+                warn!(logopt, "lookup(file): error reading map {}", self.mapname());
                 break;
             }
         }
@@ -779,6 +793,10 @@ impl LookupMod for LookupFile {
                 if f.eof {
                     break;
                 }
+                if f.err {
+                    warn!(logopt, "lookup(file): error reading map {}", self.mapname());
+                    break;
+                }
                 continue;
             };
             debug!(logopt, "lookup_read_master", "lookup(file): read entry {}", cstr::c(&path));
@@ -848,6 +866,10 @@ impl LookupMod for LookupFile {
         loop {
             let Some((key, mapent)) = read_one(logopt, &mut f) else {
                 if f.eof {
+                    break;
+                }
+                if f.err {
+                    warn!(logopt, "lookup(file): error reading map {}", self.mapname());
                     break;
                 }
                 continue;

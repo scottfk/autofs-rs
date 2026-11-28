@@ -307,8 +307,14 @@ impl Grammar for Parse<'_> {
 /// isn't one); `Err(())` (C's 1) if the file can't be read or doesn't parse.
 #[allow(clippy::result_unit_err)]
 pub fn nsswitch_parse(list: &mut Vec<NssSource>) -> Result<(), ()> {
-    let data = match sys::read_file(NSSWITCH_FILE) {
-        Ok(d) => d,
+    let data = match sys::open_read_file(NSSWITCH_FILE) {
+        Ok(Ok(d)) => d,
+        // The file opens but can't be read (a directory): flex's YY_INPUT
+        // sees fread() fail and calls yy_fatal_error(), which exits.
+        Ok(Err(_)) => {
+            sys::write_stderr(b"input in flex scanner failed\n");
+            sys::exit(2);
+        }
         Err(e) => {
             logerr!("open_fopen_r", "211", "failed to open file: {}", sys::strerror(e));
             logerr!("nsswitch_parse", "172", "couldn't open {}", NSSWITCH_FILE);

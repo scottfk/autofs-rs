@@ -159,6 +159,9 @@ impl LookupProgram {
         let mut state = St::Space;
         let mut quoted = false;
         let (mut fd0, mut fd1) = (pr, er);
+        // QUIRK: each pipe poll() reports is drained with blocking reads until
+        // EOF, so a program with output waiting on one pipe and more than a
+        // pipe's worth for the other blocks on that one, and the lookup with it.
         loop {
             let (r, rev0, rev1) = sys::poll2(fd0, fd1);
             if r < 0 && sys::errno() != libc::EINTR {

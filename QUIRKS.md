@@ -25,8 +25,9 @@ The last section lists where the port can't or doesn't follow C, and why.
 |---|---|---|---|
 | medium | `uname()`'s result is tested the wrong way round, so when it works the amd defaults `arch`, `karch`, `os` and `osver` are set to nothing (and the `${arch}`-style macros built from them are missing, so amd's `os==...`-style selectors fail with "failed to get selector"). `autofs_use_lofs` gets `auto_dir`'s default (`/a`). | `ConfCache::load_amd_defaults` | `amd_selectors`, `amd_expansion` |
 | medium | Lines that don't start with a letter or `[` are ignored, indented ones included: `  timeout = 5` does nothing. | `defaults::parse_line` | `dump_conf_indented` |
-| low | Lines are read 256 bytes at a time, so a longer line is parsed as several and the "was truncated, ignored" message can never appear. | `defaults::fgets_chunks` | - |
+| low | Lines are read 256 bytes at a time, so a longer line is parsed as several and the "was truncated, ignored" message can never appear. | `defaults::fgets_chunks` | `hostile_conf_dump`, `hostile_conf_lookup` |
 | low | The "neither file has changed" test can never be true (`stat = fstat(...) != -1` assigns the comparison), so both files are reread every time the configuration is read. | `defaults_read_config` | - |
+| low | A configuration file that opens but can't be read (a directory) logs "fgets returned error 1 while reading config" and sets nothing; "failed to open" isn't logged, since the open worked. | `defaults::open_read`, `read_config` | `hostile_conf_not_files` |
 | low | Settings with defaults (`timeout`, `logging`, `browse_mode`...) are exported to the environment under their own names (`setenv("timeout", "600", 0)`), where programs autofs runs see them, and an environment variable of that name overrides both the default and the file. | `ConfCache::add`, `update` | `dump_conf_env` |
 
 ## Macros (lib/macros.c, lib/mounts.c)
@@ -65,6 +66,7 @@ The last section lists where the port can't or doesn't follow C, and why.
 | low | A parse that's abandoned part way leaves the rest of its buffer in the scanner; the next read of `nsswitch.conf` scans that first, then the file again. | `nsswitch::State::scanner` | `dump_nsswitch_errors` |
 | low | Characters the `automount:` line's rules don't cover (`#`, `!`, `\|`, `=` outside brackets) are logged on a line of their own by flex's default rule, and the rest of a comment is read as sources ("ignored unsupported autofs nsswitch source"). | `Parse::lex` (rule 16) | `dump_nsswitch`, `dump_nsswitch_echo_and_long` |
 | low | The syntax error message has an extra newline (a blank line on stderr). A source name of 128 bytes or more trips `_FORTIFY_SOURCE` and aborts. | `nsswitch::nss_error`, `Val::set` | `dump_nsswitch_errors`, `dump_nsswitch_echo_and_long` |
+| low | An `nsswitch.conf` that opens but can't be read (a directory) ends the program: flex's `YY_INPUT` sees `fread()` fail and `yy_fatal_error()` prints "input in flex scanner failed" and exits with status 2. | `nsswitch::nsswitch_parse` | `hostile_nsswitch` |
 
 ## File maps (modules/lookup_file.c, lib/parse_subs.c)
 
@@ -73,6 +75,7 @@ The last section lists where the port can't or doesn't follow C, and why.
 | medium | Keys with a byte of 128 or more are dropped: `sanitize_path()` compares a signed `char` with 32. | `parse_subs::sanitize_path` | `dump_non_ascii_keys` |
 | low | `sanitize_path()` never removes a trailing `/` from a key (its test measures the string past its end). | `parse_subs::sanitize_path` | `dump_map_scanner` |
 | low | A line that starts with a blank after an entry continues it, but `read_one()` reads the continuation without keeping it; anything but blanks on it makes the whole entry a "bad map entry". | `lookup_file::read_one` | `dump_map_scanner` |
+| low | A map file that opens but can't be read (a directory: an empty `+` include in the master map names `/etc/autofs/`) logs "error reading map" and reads as empty. | `lookup_file::open_map` | `hostile_master_malformed` |
 
 ## Key lookups (daemon/lookup.c, lib/mounts.c, modules/parse_sun.c, modules/lookup_program.c)
 
@@ -82,6 +85,7 @@ The last section lists where the port can't or doesn't follow C, and why.
 | low | Colons after a `:/` become slashes in the expanded entry, including colons that came from macros (`$UID:$GID` in a location). | `parse_sun::expandsunent` | `lookup_users`, `lookup_sun_no_slashify` |
 | low | `sun_mount()` passes `nobrowse`, `browse` and `timeout=` on only for `fstype=autofs`, drops `bg` and `nofg` silently, and adds the map's `-D` macros to an autofs mount's options. | `ParseSun::sun_mount` | `lookup_sun_entries` |
 | low | A program map's child changes to the mount point directory before running the program; when that fails (the directory doesn't exist yet) its warning goes to the program's stderr and comes back as a `>> ` line. | `LookupProgram::lookup_one` | `lookup_program` |
+| medium | A program map that has output waiting on stderr while it writes more than a pipe's worth (64 KiB) to stdout, or the other way round, hangs the lookup for good: `lookup_one()` drains whichever pipe `poll()` reported with blocking reads until EOF, and the program blocks writing to the other one. The process walking into the key hangs with it. The "failed to set PWD" warning above counts as stderr output. | `LookupProgram::lookup_one` | `hostile_program_deadlock` |
 
 ## Multi maps (modules/lookup_multi.c)
 
