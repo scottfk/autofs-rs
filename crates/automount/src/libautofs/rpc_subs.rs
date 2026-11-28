@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use tirpc::addr::Netbuf;
 use tirpc::clnt::{
     Client, Control, Lib, RPC_CANTENCODEARGS, RPC_N2AXLATEFAILURE, RPC_PROGNOTREGISTERED, RPC_PROGUNAVAIL,
-    RPC_PROGVERSMISMATCH, RPC_SUCCESS, RPC_TIMEDOUT, RPC_UNKNOWNADDR, RPC_UNKNOWNPROTO, Timeval,
+    RPC_PROGVERSMISMATCH, RPC_SUCCESS, RPC_SYSTEMERROR, RPC_TIMEDOUT, RPC_UNKNOWNADDR, RPC_UNKNOWNPROTO, Timeval,
 };
 use tirpc::rpcb_clnt::{PMAPPROC_GETPORT, PMAPVERS, RPCBPROC_GETADDR, RPCBPROG, RPCBVERS, RPCBVERS4};
 use tirpc::rpcb_prot::{Rpcb, put_rpcb};
@@ -24,6 +24,12 @@ pub const NFS3_VERSION: u32 = 3;
 pub const NFS4_VERSION: u32 = 4;
 pub const NFS_PORT: u16 = 2049;
 const NFSPROC_NULL: u32 = 0;
+const EXPPATHLEN: u32 = 1024;
+const EXPNAMELEN: u32 = 255;
+const MOUNTPROG: u32 = 100005;
+const MOUNTPROC_EXPORT: u32 = 5;
+/// `MOUNTVERS_NFSV3`, `MOUNTVERS_POSIX`, `MOUNTVERS`.
+const MOUNT_VERS: [u32; 3] = [3, 2, 1];
 const PMAPPORT: u16 = 111;
 
 pub const RPC_PING_FAIL: i32 = 0x0000;
@@ -49,7 +55,7 @@ use crate::modules::replicated::{NFS2_REQUESTED, NFS3_REQUESTED, NFS4_REQUESTED,
 /// libtirpc's process-wide state (`rpc_createerr`, the netconfig database).
 static LIB: Mutex<Option<Lib>> = Mutex::new(None);
 
-fn with_lib<T>(f: impl FnOnce(&mut Lib) -> T) -> T {
+pub(crate) fn with_lib<T>(f: impl FnOnce(&mut Lib) -> T) -> T {
     let mut g = LIB.lock().unwrap_or_else(|e| e.into_inner());
     f(g.get_or_insert_with(Lib::default))
 }
@@ -702,6 +708,116 @@ pub fn rpc_ping(host: &[u8], port: i32, version: u32, seconds: i64, micros: i64,
         }
     }
     status
+}
+
+/// A `struct exportinfo`: an exported directory and its groups (hosts).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExportInfo {
+    pub dir: Vec<u8>,
+    pub hosts: Vec<Vec<u8>>,
+}
+
+/// `xdr_exports()` decoding: a list of `xdr_pointer()`s to export entries,
+/// each with a list of host names. `None` (and nothing kept) if any of it
+/// fails, as C frees the list it decoded.
+fn get_exports(x: &mut dyn XdrDecode) -> Option<Vec<ExportInfo>> {
+    let mut out = Vec::new();
+    while xdr::get_bool(x)? {
+        let dir = xdr::get_string(x, EXPPATHLEN)?;
+        let mut hosts = Vec::new();
+        while xdr::get_bool(x)? {
+            hosts.push(xdr::get_string(x, EXPNAMELEN)?);
+        }
+        out.push(ExportInfo { dir, hosts });
+    }
+    Some(out)
+}
+
+/// `rpc_get_exports_proto()`: `MOUNTPROC_EXPORT` (mount versions 3, 2 and 1
+/// in turn), with `AUTH_SYS` credentials.
+fn rpc_get_exports_proto(info: &mut ConnInfo) -> Option<Vec<ExportInfo>> {
+    let proto = info.proto;
+    let option = info.close_option;
+    if info.proto == libc::IPPROTO_UDP {
+        info.send_sz = UDPMSGSIZE;
+        info.recv_sz = UDPMSGSIZE;
+    }
+    let (ret, client) = create_client(info);
+    if ret < 0 {
+        return None;
+    }
+    // A NULL client: clnt_control() on it would crash C.
+    let mut client = client?;
+    client.control(Control::SetTimeout(info.timeout));
+    client.control(Control::SetRetryTimeout(info.timeout));
+    if !with_lib(|lib| client.set_auth_unix_default(lib)) {
+        error!(LOGOPT_ANY, "rpc_get_exports_proto", "auth create failed");
+        client.destroy();
+        return None;
+    }
+    let mut exports: Option<Vec<ExportInfo>> = None;
+    let mut vers_entry = 0;
+    let status = loop {
+        let status = client.call(
+            MOUNTPROC_EXPORT,
+            &mut |_| true,
+            &mut |x| {
+                exports = get_exports(x);
+                exports.is_some()
+            },
+            info.timeout,
+        );
+        if status == RPC_SUCCESS || status == RPC_SYSTEMERROR {
+            break status;
+        }
+        vers_entry += 1;
+        if vers_entry > 2 {
+            break status;
+        }
+        client.control(Control::SetVers(MOUNT_VERS[vers_entry]));
+    };
+    // Only play with the close options if we think it completed OK.
+    if proto == libc::IPPROTO_TCP && status == RPC_SUCCESS && option == RPC_CLOSE_NOLINGER {
+        nolinger(client.fd());
+    }
+    client.set_auth_none();
+    client.destroy();
+    if status != RPC_SUCCESS {
+        return None;
+    }
+    Some(exports.unwrap_or_default())
+}
+
+/// `rpc_get_exports()`: the host's export list, over UDP and then TCP.
+/// `None` on failure; an empty list is a host exporting nothing (C's NULL
+/// either way).
+pub fn rpc_get_exports(host: &[u8], seconds: i64, micros: i64, option: u32) -> Option<Vec<ExportInfo>> {
+    let mut info = ConnInfo {
+        host: Some(host.to_vec()),
+        program: MOUNTPROG,
+        version: MOUNT_VERS[0],
+        timeout: Timeval { sec: seconds, usec: micros },
+        close_option: option,
+        ..ConnInfo::default()
+    };
+    let mut parms = PmapParms { prog: info.program, vers: info.version, prot: 0, port: 0 };
+    // Try UDP first.
+    for proto in [libc::IPPROTO_UDP, libc::IPPROTO_TCP] {
+        info.proto = proto;
+        parms.prot = proto as u32;
+        let mut port = 0;
+        if rpc_portmap_getport(&mut info, &parms, &mut port) < 0 {
+            if proto == libc::IPPROTO_TCP {
+                return None;
+            }
+            continue;
+        }
+        info.port = port;
+        if let Some(e) = rpc_get_exports_proto(&mut info) {
+            return Some(e);
+        }
+    }
+    None
 }
 
 /// `monotonic_elapsed()`.

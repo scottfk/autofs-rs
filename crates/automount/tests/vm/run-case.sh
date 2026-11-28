@@ -3,6 +3,7 @@
 # 20261127 - Time-limit the final tree listing so a dead daemon cannot hang a run - Claude - scottfk
 # 20261127 - Add restartd: kill the daemon with SIGKILL and start it again over its mounts - Claude - scottfk
 # 20261127 - A case with a net file gets a network namespace and fake NFS servers (net-setup.sh) - Claude - scottfk
+# 20261127 - UTS namespace with the case's NIS domain (domain file); var/ laid over /var - Claude - scottfk
 #
 # run-case.sh - run one daemon case on the root test VM (see tests/common/vm.rs)
 #
@@ -14,7 +15,8 @@
 # runs in a private mount namespace: /etc and /usr are overlays, /run, /mnt
 # and /tmp are tmpfs, so nothing it does outlives it. mount and umount are
 # recorders that log to out/cmds and run the real programs (NFS mounts become
-# tmpfs mounts). Outputs go to CASEDIR/out.
+# tmpfs mounts). A domain file sets the NIS domain (in a UTS namespace of the
+# case's own) and var/ is laid over /var. Outputs go to CASEDIR/out.
 set -eu
 IMPL=$1
 C=$2
@@ -25,13 +27,19 @@ mkdir -p "$C/out" "$C/ovl"
 [ -x "$B/real-umount" ] || cp /usr/bin/umount "$B/real-umount"
 NETNS=
 [ -f "$C/net" ] && NETNS=-n
-exec unshare -m $NETNS --propagation private sh -eu -c '
+exec unshare -m -u $NETNS --propagation private sh -eu -c '
 B=$1; C=$2; IMPL=$3
 mount -t tmpfs tmpfs "$C/ovl"
 mkdir -p "$C/ovl/eu" "$C/ovl/ew" "$C/ovl/uu" "$C/ovl/uw" "$C/ovl/srv"
 mount -t overlay overlay -o lowerdir=/etc,upperdir="$C/ovl/eu",workdir="$C/ovl/ew" /etc
 mount -t overlay overlay -o lowerdir=/usr,upperdir="$C/ovl/uu",workdir="$C/ovl/uw" /usr
 for d in /run /mnt /tmp; do mount -t tmpfs tmpfs $d; done
+if [ -d "$C/var" ]; then
+	mkdir -p "$C/ovl/vu" "$C/ovl/vw"
+	mount -t overlay overlay -o lowerdir=/var,upperdir="$C/ovl/vu",workdir="$C/ovl/vw" /var
+	cp -a "$C/var/." /var/
+fi
+if [ -f "$C/domain" ]; then cat "$C/domain" > /proc/sys/kernel/domainname; else echo "(none)" > /proc/sys/kernel/domainname; fi
 rm -rf /etc/autofs /etc/conf.d/autofs /etc/auto.master
 mkdir -p /etc/autofs
 [ -d "$C/etc" ] && cp -a "$C/etc/." /etc/

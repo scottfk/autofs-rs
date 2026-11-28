@@ -138,6 +138,16 @@ The last section lists where the port can't or doesn't follow C, and why.
 | low | A host's `addr_len` is `INET_ADDRSTRLEN` or `INET6_ADDRSTRLEN`, not the address's size, and `tcp6`/`udp6` skip IPv4 hosts by comparing it with `INET_ADDRSTRLEN`. | `replicated::add_new_host`, `replicated::check_address_proto` | - |
 | low | The `nosymlink` warning says "depricated". | `mount_nfs` | - |
 
+## -hosts and NIS maps (modules/lookup_hosts.c, modules/lookup_yp.c, lib/rpc_subs.c, libnsl)
+
+| Severity | Quirk | Where | Test |
+|---|---|---|---|
+| medium | A `SIGHUP` (map reload) of a browsable `-hosts` map with a host mounted kills the daemon (`SIGSEGV`): reading the host list again clears the host's entry, the export list update then finds nothing to change (same age), and `add_update_entry()` `strdup()`s the NULL map entry. `browse_mode = no` (hydra's setting) is safe. | `LookupHosts::update_hosts_mounts` | `daemon_hosts_browse` |
+| low | An export list is sorted by path length only (a tree that sends equal lengths right, so they keep the server's order), not by name; a path listed twice is dropped with `tree_host_cmp: duplicate entry ... ignored`. The debug message says "fetchng". | `lookup_hosts::get_exports` | `daemon_hosts_map` |
+| low | A wildcard lookup that fails with an RPC or binding error returns the negated `YPERR_` code, whose bits are then tested as `CHE_` flags: `-YPERR_RPC` reads as both "missing" (the cached wildcard is deleted) and "updated" (the lookup succeeds). | `LookupYp::check_map_indirect` | - |
+| low | Browsing a NIS map lists every key, the server's `YP_LAST_MODIFIED` (and other `YP_` bookkeeping keys) included. | `LookupYp::read_map` | `daemon_yp_browse` |
+| low | libnsl asks ypbind twice when binding fails (once when no binding file is found, again as its "third chance"), and retries a failed `yp_all()` once, running the callback again for every entry read before the failure. | `yp::do_ypcall`, `yp::yp_all` | `daemon_yp_failures` |
+
 ## Startup (daemon/automount.c, lib/mounts.c)
 
 | Severity | Quirk | Where | Test |
@@ -157,6 +167,8 @@ The last section lists where the port can't or doesn't follow C, and why.
 | Three amd error messages have a `%s` without an argument: "sublink option requires option fs" (two of them) and "mount type ... not valid as ufs mount type" print whatever a register held in C; the port prints the location's type there. | Undefined behavior. |
 | An amd program map answer shorter than its key is read from a model of the reused answer buffer (the last answer's bytes past its NUL). In C what's there depends on the heap; glibc hands back the chunk the last answer freed, which the model follows. | Reading past the end of a string. |
 | A busy expire or map read thread that's asked to cancel stops at the point C tests for a cancel (`pthread_testcancel()`) or between steps, not at any cancellation point (`read()`, `nanosleep()`...) inside. | Rust has no thread cancellation. |
+| A ypbind answer of success with no binding (a NULL `ypbind3_binding`) is "Can't communicate with ypserv"; a mount daemon client that `create_client()` reports made but is NULL fails the export list. C dereferences the NULL in both. | NULL pointer dereferences. |
+| libnsl's list of bindings isn't kept: only `yp_bind()` adds to it, and autofs never calls that, so in C every call binds afresh too. | Nothing to keep. |
 | An autofs point's pipe and ioctl descriptors start as 0: C `malloc()`s the structure and only sets them when it opens the pipe, so with `-U` they're whatever the memory held (0 on a fresh heap). | Uninitialized memory. |
 | Restarting over a mounted multi-mount in a direct map reconnects to it. C deadlocks there: `mount_autofs_direct()` holds the map cache's read lock while it reconnects each trigger, and re-reading the multi-mount entry takes the same cache's write lock (`cache_writelock()` in the same thread), so the daemon hangs at startup. | An upstream self-deadlock; the port's cache locks are only held briefly. Not compared (`daemon_restart_direct` leaves the multi-mount unmounted). |
 | "error 0x%d getting portmap client" and "error 0x%d getting service port" have no argument for their `%d`, so C prints whatever a register held; the port prints the status. | Undefined behavior. |

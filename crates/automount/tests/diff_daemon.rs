@@ -710,3 +710,185 @@ fn daemon_nfs_v4_default() {
             ),
     );
 }
+
+// ---------------------------------------------------------------------------
+// -hosts maps, amd type:=host and NIS (phase 5b), against fake-nfsd's mount
+// daemons, ypserv and ypbind.
+
+// s2 exports (out of length order, one twice), s3 only over TCP, s4 nothing.
+const HNET: &str = "10.77.0.2 tcp 3,4 exports=/b/c@10.0.0.0/8+s9,/a,/xyz,/a\n10.77.0.2 udp 3\n\
+                    10.77.0.3 tcp 3 exports=/only\n10.77.0.4 tcp 3\n10.77.0.4 udp 3\n";
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_hosts_map() {
+    // A lookup fetches the export list; a HUP updates mounted hosts (not
+    // browsable, as on hydra). The HUP waits for the next second: a master
+    // map read in the same second as the last is ignored as a duplicate.
+    check_vm(
+        VmCase::new("d_hosts", "/net -hosts\n")
+            .net(HNET)
+            .etc("hosts", NETHOSTS)
+            .conf("[ autofs ]\nbrowse_mode = no\n")
+            .steps(
+                "ready 'mounted indirect on /net'\ntrig /net/s2; waitlog 'mounted /net/s2'\ntrig /net/s2/a; waitlog 'mounted /net/s2/a'\n\
+                 trig /net/s2/b/c; waitlog 'mounted /net/s2/b/c'\ntrig /net/s3/only; waitlog 'mounted /net/s3/only'\n\
+                 trig /net/s4; waitlog 'failed to mount /net/s4'\ntrig /net/s2/nope\nquiet 0.5\nsnap\n\
+                 sleep 1.1; sig HUP; waitlog 'attempt to update exports for s3'; quiet 1\nsnap\nstopd\n",
+            ),
+    );
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_hosts_browse() {
+    // browse_mode: every host in /etc/hosts is a directory. A HUP with a
+    // host mounted crashes C (see update_hosts_mounts()).
+    check_vm(
+        VmCase::new("d_hosts_browse", "/net -hosts\n")
+            .net(HNET)
+            .etc("hosts", NETHOSTS)
+            .conf("[ autofs ]\nbrowse_mode = yes\n")
+            .steps(
+                "ready 'mounted indirect on /net'; quiet 0.5\nnote \"$(ls /net | sort | tr '\\n' ' ')\"\n\
+                 trig /net/s2/a; waitlog 'mounted /net/s2/a'\ntrig /net/n2; waitlog '/net/n2'\nquiet 0.5\nsnap\n\
+                 sig HUP; waitlog 'never' 30 quiet\nsnap\nstopd\n",
+            ),
+    );
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_amd_host() {
+    // type:=host: the host's export tree under the autofs point; a key that
+    // isn't the host's name is a symlink to it.
+    check_vm(
+        VmCase::new("d_amd_host", "/mnt/h file,amd:/etc/autofs/amd.h\n")
+            .net(HNET)
+            .etc("hosts", NETHOSTS)
+            .map("amd.h", "s2 type:=host;rhost:=s2\nalias type:=host;rhost:=s3\nempty type:=host;rhost:=s4\nnorhost type:=host\n")
+            .steps(
+                "ready 'mounted indirect on /mnt/h'\ntrig /mnt/h/s2/a; waitlog 'mounted /mnt/h/s2/a'\n\
+                 trig /mnt/h/s2/b/c; waitlog 'mounted /mnt/h/s2/b/c'\ntrig /mnt/h/alias/only; waitlog '/mnt/h/s3/only'\n\
+                 note \"$(readlink /mnt/h/alias)\"\ntrig /mnt/h/empty; waitlog '/mnt/h/empty'\n\
+                 trig /mnt/h/norhost; waitlog '/mnt/h/norhost'\nquiet 0.5\nsnap\nstopd\n",
+            )
+            .unordered_log(),
+    );
+}
+
+/// ypserv's maps for domain dom1 (on s2, 10.77.0.2). The logs compare
+/// unordered: mount points shut down in racing order.
+fn yp_case(name: &str, master: &str, net: &str) -> VmCase {
+    VmCase::new(name, master)
+        .unordered_log()
+        .net(net)
+        .etc("hosts", NETHOSTS)
+        .domain("dom1")
+        .file(
+            "yp/dom1/auto.y",
+            b"YP_LAST_MODIFIED 100\na :/etc/autofs\nb s2:/b\n* :/usr/share\n+inc :/x\nbad/key :/x\n",
+        )
+        .file("yp/dom1/auto.z", b"c :/etc\n")
+        .file("yp/dom1/auto.master", b"/y auto.y\n/z yp:auto_z\n+auto.more\n")
+        .file("yp/dom1/auto.d", b"/mnt/d1 :/etc\n")
+        .file("yp/dom2/auto.y", b"a :/etc\n")
+}
+
+const YPNET: &str = "10.77.0.2 tcp 3,4 ypserv=yp\n10.77.0.2 udp 3\n127.0.0.1 tcp - ypbind=dom1@s2\n";
+const YPSTEPS: &str = "ready 'mounted indirect on /y'\ntrig /y/a; waitlog 'mounted /y/a'\ntrig /y/b; waitlog 'mounted /y/b'\n\
+                       trig /y/other; waitlog '/y/other'\ntrig /z/c; waitlog '/z/c'\ntrig /z/nokey; waitlog '/z/nokey'\n\
+                       quiet 0.5\nsnap\nstopd\n";
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_yp_maps() {
+    // Bound through ypbind (version 3); auto_z is found as auto.z; a map
+    // the server lacks fails.
+    check_vm(yp_case("d_yp", "/y yp:auto.y\n/z yp:auto_z\n/w nis:auto.none\n/- yp:auto.d\n", YPNET).steps(
+        "ready 'mounted indirect on /y'\ntrig /y/a; waitlog 'mounted /y/a'\ntrig /y/b; waitlog 'mounted /y/b'\n\
+             trig /y/other; waitlog '/y/other'\ntrig /z/c; waitlog '/z/c'\ntrig /z/nokey; waitlog '/z/nokey'\n\
+             trig /w/q; waitlog '/w/q'\ntrig /mnt/d1/; waitlog '/mnt/d1'\nquiet 0.5\nsnap\nstopd\n",
+    ));
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_yp_browse() {
+    // browse_mode: the map is read with yp_all (keys checked and sanitized).
+    check_vm(
+        yp_case("d_yp_browse", "/y yp:auto.y\n/z yp:auto_z\n", YPNET)
+            .conf("[ autofs ]\nbrowse_mode = yes\n")
+            .steps("ready 'mounted indirect on /z'\nnote \"$(ls /y /z | tr '\\n' ' ')\"\ntrig /y/a; waitlog 'mounted /y/a'\nquiet 0.5\nsnap\nstopd\n"),
+    );
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_yp_master() {
+    // The master map from NIS (nsswitch automount: nis).
+    check_vm(yp_case("d_yp_master", "-", YPNET).etc("nsswitch.conf", "hosts: files\nautomount: nis\n").steps(YPSTEPS));
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_yp_ypbind2() {
+    // A ypbind that only speaks version 2 (an address binding).
+    let net = "10.77.0.2 tcp 3,4 ypserv=yp\n10.77.0.2 udp 3\n127.0.0.1 tcp - ypbind=dom1@10.77.0.2 ypbindvers=2\n";
+    check_vm(yp_case("d_yp_bind2", "/y yp:auto.y\n/z yp:auto_z\n", net).steps(YPSTEPS));
+}
+
+/// `/var/yp/binding/dom1.3`: an XDR ypbind3_binding naming s2.
+fn binding3() -> Vec<u8> {
+    let mut b = Vec::new();
+    for w in [0u32, 0, 2] {
+        b.extend_from_slice(&w.to_be_bytes());
+    }
+    b.extend_from_slice(b"s2\0\0");
+    for w in [2u32, 2] {
+        b.extend_from_slice(&w.to_be_bytes());
+    }
+    b
+}
+
+/// `/var/yp/binding/dom1.2`: a port, then a ypbind2_resp as in memory.
+fn binding2() -> Vec<u8> {
+    let mut b = vec![0u8, 0];
+    b.extend_from_slice(&1u32.to_ne_bytes());
+    b.extend_from_slice(&[10, 77, 0, 2, 3, 66, 0, 0]);
+    b
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_yp_binding_files() {
+    // No ypbind: binding files, version 3 and then version 2.
+    let net = "10.77.0.2 tcp 3,4 ypserv=yp\n10.77.0.2 udp 3\n";
+    check_vm(
+        yp_case("d_yp_file3", "/y yp:auto.y\n/z yp:auto_z\n", net)
+            .file("var/yp/binding/dom1.3", &binding3())
+            .steps(YPSTEPS),
+    );
+    check_vm(
+        yp_case("d_yp_file2", "/y yp:auto.y\n/z yp:auto_z\n", net)
+            .file("var/yp/binding/dom1.2", &binding2())
+            .steps(YPSTEPS),
+    );
+}
+
+#[test]
+#[ignore = "needs the root test VM (make vmcheck)"]
+fn daemon_yp_failures() {
+    // No binding at all; ypbind without the domain; a bound server that
+    // doesn't answer; no domain name.
+    let net = "10.77.0.2 tcp 3,4 ypserv=yp\n10.77.0.2 udp 3\n";
+    let steps = "ready 'mounted indirect on /y'\ntrig /y/a; waitlog '/y/a' 400\nquiet 0.5\nsnap\nstopd\n";
+    check_vm(yp_case("d_yp_nobind", "/y yp:auto.y\n", net).steps(steps));
+    let net2 = "10.77.0.2 tcp 3,4 ypserv=yp\n10.77.0.2 udp 3\n127.0.0.1 tcp - ypbind=other@s2\n";
+    check_vm(yp_case("d_yp_nodom", "/y yp:auto.y\n", net2).steps(steps));
+    let net3 = "10.77.0.2 tcp 3,4\n10.77.0.2 udp 3\n127.0.0.1 tcp - ypbind=dom1@s2\n";
+    check_vm(yp_case("d_yp_noserv", "/y yp:auto.y\n", net3).steps(steps));
+    let mut c = yp_case("d_yp_none", "/y yp:auto.y\n", YPNET);
+    c.files.retain(|(p, _)| p != "domain");
+    check_vm(c.steps("sleep 2\nsnap\nstopd\n"));
+}

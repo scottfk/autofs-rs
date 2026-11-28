@@ -2,6 +2,7 @@
 //! daemons on the addresses of a configuration file, one line each:
 //!
 //!     ADDR PROTO VERSIONS [delay=MS] [norpcbind] [exports=DIR@HOST+HOST,DIR@...]
+//!          [ypserv=DIR] [ypbind=DOMAIN@SERVER,...] [ypbindvers=2,3]
 //!
 //! `PROTO` is `tcp` or `udp`, `VERSIONS` the NFS versions answered on it
 //! (`3,4`; empty with `-`). rpcbind (port 111) answers `PMAPPROC_GETPORT` and
@@ -9,6 +10,13 @@
 //! `NULL` (`PROG_MISMATCH` for other versions) after the delay, and mountd
 //! answers `MOUNTPROC_EXPORT` with the exports. When every socket is up it
 //! writes its pid to `READY`, the second argument.
+//!
+//! `ypserv=DIR` adds a ypserv (on 834) serving `DIR/DOMAIN/MAP` files (DIR
+//! relative to `$FAKE_NFSD_DIR`), each line a key, a space and the value:
+//! `YPPROC_MATCH` and `YPPROC_ALL`, with `YP_NODOM`, `YP_NOMAP` and
+//! `YP_NOKEY` for what isn't there. `ypbind=` adds a ypbind (TCP, on 835)
+//! that binds each domain to its server (`YPBINDPROC_DOMAIN`, versions
+//! `ypbindvers`, default 2 and 3); other domains get `YPBIND_FAIL_VAL`.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -21,6 +29,10 @@ const NFS_PROG: u32 = 100003;
 const MOUNT_PROG: u32 = 100005;
 const NFS_PORT: u16 = 2049;
 const MOUNT_PORT: u16 = 20048;
+const YP_PROG: u32 = 100004;
+const YPBIND_PROG: u32 = 100007;
+const YP_PORT: u16 = 834;
+const YPBIND_PORT: u16 = 835;
 
 #[derive(Debug, Clone, Default)]
 struct Svc {
@@ -29,6 +41,9 @@ struct Svc {
     delay: u64,
     norpcbind: bool,
     exports: Vec<(String, Vec<String>)>,
+    ypserv: Option<std::path::PathBuf>,
+    ypbind: Vec<(String, String)>,
+    ypbindvers: Vec<u32>,
 }
 
 fn parse(conf: &str) -> HashMap<IpAddr, Svc> {
@@ -49,6 +64,16 @@ fn parse(conf: &str) -> HashMap<IpAddr, Svc> {
                 s.delay = d.parse().unwrap();
             } else if *o == "norpcbind" {
                 s.norpcbind = true;
+            } else if let Some(d) = o.strip_prefix("ypserv=") {
+                let base = std::env::var("FAKE_NFSD_DIR").unwrap_or_else(|_| ".".into());
+                s.ypserv = Some(std::path::Path::new(&base).join(d));
+            } else if let Some(b) = o.strip_prefix("ypbind=") {
+                for e in b.split(',') {
+                    let (d, srv) = e.split_once('@').expect("DOMAIN@SERVER");
+                    s.ypbind.push((d.to_string(), srv.to_string()));
+                }
+            } else if let Some(v) = o.strip_prefix("ypbindvers=") {
+                s.ypbindvers = v.split(',').map(|v| v.parse().unwrap()).collect();
             } else if let Some(e) = o.strip_prefix("exports=") {
                 for ex in e.split(',') {
                     let (dir, hosts) = ex.split_once('@').unwrap_or((ex, ""));
@@ -124,6 +149,10 @@ fn answer(svc: &Svc, addr: IpAddr, port: u16, proto: u32, b: &[u8]) -> Option<Ve
                 match prog {
                     NFS_PROG if nfs_vers(prot).contains(&vers) => NFS_PORT,
                     MOUNT_PROG if svc.vers.contains_key(&prot) && (1..=3).contains(&vers) => MOUNT_PORT,
+                    YP_PROG if svc.ypserv.is_some() && svc.vers.contains_key(&prot) && vers == 2 => YP_PORT,
+                    YPBIND_PROG if !svc.ypbind.is_empty() && prot == 6 && ypbind_vers(svc).contains(&vers) => {
+                        YPBIND_PORT
+                    }
                     _ => 0,
                 }
             };
@@ -184,8 +213,137 @@ fn answer(svc: &Svc, addr: IpAddr, port: u16, proto: u32, b: &[u8]) -> Option<Ve
             put(&mut r, 0);
             Some(r)
         }
+        (YP_PORT, YP_PROG) => {
+            let Some(dir) = &svc.ypserv else { return Some(reply(c.xid, 1)) };
+            if c.vers != 2 {
+                let mut r = reply(c.xid, 2);
+                put(&mut r, 2);
+                put(&mut r, 2);
+                return Some(r);
+            }
+            let mut i = 0;
+            match c.proc_ {
+                0 => Some(reply(c.xid, 0)),
+                3 => {
+                    let (domain, map, key) =
+                        (get_str(c.args, &mut i)?, get_str(c.args, &mut i)?, get_str(c.args, &mut i)?);
+                    let mut r = reply(c.xid, 0);
+                    match yp_map(dir, &domain, &map) {
+                        Err(st) => {
+                            put(&mut r, st as u32);
+                            put_str(&mut r, b"");
+                        }
+                        Ok(ents) => match ents.iter().find(|(k, _)| *k == key) {
+                            Some((_, v)) => {
+                                put(&mut r, 1);
+                                put_str(&mut r, v);
+                            }
+                            None => {
+                                put(&mut r, -3i32 as u32);
+                                put_str(&mut r, b"");
+                            }
+                        },
+                    }
+                    Some(r)
+                }
+                8 => {
+                    let (domain, map) = (get_str(c.args, &mut i)?, get_str(c.args, &mut i)?);
+                    let mut r = reply(c.xid, 0);
+                    match yp_map(dir, &domain, &map) {
+                        Err(st) => {
+                            put(&mut r, 1);
+                            put(&mut r, st as u32);
+                            put_str(&mut r, b"");
+                            put_str(&mut r, b"");
+                        }
+                        Ok(ents) => {
+                            for (k, v) in ents {
+                                put(&mut r, 1);
+                                put(&mut r, 1);
+                                put_str(&mut r, &v);
+                                put_str(&mut r, &k);
+                            }
+                        }
+                    }
+                    put(&mut r, 0);
+                    Some(r)
+                }
+                _ => Some(reply(c.xid, 3)),
+            }
+        }
+        (YPBIND_PORT, YPBIND_PROG) => {
+            let vers = ypbind_vers(svc);
+            if !vers.contains(&c.vers) {
+                let mut r = reply(c.xid, 2);
+                put(&mut r, *vers.iter().min().unwrap());
+                put(&mut r, *vers.iter().max().unwrap());
+                return Some(r);
+            }
+            if c.proc_ == 0 {
+                return Some(reply(c.xid, 0));
+            }
+            if c.proc_ != 1 {
+                return Some(reply(c.xid, 3));
+            }
+            let mut i = 0;
+            let domain = get_str(c.args, &mut i)?;
+            let mut r = reply(c.xid, 0);
+            match svc.ypbind.iter().find(|(d, _)| d.as_bytes() == domain.as_slice()) {
+                None => {
+                    put(&mut r, 2);
+                    put(&mut r, 2);
+                }
+                Some((_, srv)) => {
+                    put(&mut r, 1);
+                    if c.vers == 3 {
+                        // ypbind3_binding: no netconfig, no address, the name.
+                        put(&mut r, 1);
+                        put(&mut r, 0);
+                        put(&mut r, 0);
+                        put_str(&mut r, srv.as_bytes());
+                        put(&mut r, 2);
+                        put(&mut r, 2);
+                    } else {
+                        let a: std::net::Ipv4Addr = srv.parse().expect("a v2 binding needs an address");
+                        r.extend_from_slice(&a.octets());
+                        r.extend_from_slice(&YP_PORT.to_be_bytes());
+                        r.extend_from_slice(&[0, 0]);
+                    }
+                }
+            }
+            Some(r)
+        }
         _ => Some(reply(c.xid, 1)),
     }
+}
+
+/// The versions the fake ypbind answers.
+fn ypbind_vers(svc: &Svc) -> Vec<u32> {
+    if svc.ypbindvers.is_empty() { vec![2, 3] } else { svc.ypbindvers.clone() }
+}
+
+/// A map's entries, or the `ypstat` for a domain or map that isn't there.
+/// A map's (key, value) entries.
+type YpEntries = Vec<(Vec<u8>, Vec<u8>)>;
+
+fn yp_map(dir: &std::path::Path, domain: &[u8], map: &[u8]) -> Result<YpEntries, i32> {
+    use std::os::unix::ffi::OsStrExt;
+    let d = dir.join(std::ffi::OsStr::from_bytes(domain));
+    if domain.is_empty() || domain.contains(&b'/') || !d.is_dir() {
+        return Err(-2);
+    }
+    if map.is_empty() || map.contains(&b'/') {
+        return Err(-1);
+    }
+    let Ok(data) = std::fs::read(d.join(std::ffi::OsStr::from_bytes(map))) else { return Err(-1) };
+    Ok(data
+        .split(|&c| c == b'\n')
+        .filter(|l| !l.is_empty())
+        .map(|l| match l.iter().position(|&c| c == b' ') {
+            Some(p) => (l[..p].to_vec(), l[p + 1..].to_vec()),
+            None => (l.to_vec(), Vec::new()),
+        })
+        .collect())
 }
 
 fn serve_udp(sock: UdpSocket, svc: Arc<Svc>, addr: IpAddr, port: u16) {
@@ -241,6 +399,9 @@ fn main() {
     for (addr, svc) in parse(&conf) {
         let svc = Arc::new(svc);
         let mut ports = vec![NFS_PORT, MOUNT_PORT];
+        if svc.ypserv.is_some() {
+            ports.push(YP_PORT);
+        }
         if !svc.norpcbind {
             ports.push(111);
         }
@@ -251,12 +412,20 @@ fn main() {
                 let s = svc.clone();
                 threads.push(std::thread::spawn(move || serve_udp(u, s, addr, port)));
             }
-            if svc.vers.contains_key(&6) {
+            if svc.vers.contains_key(&6) || (port == 111 && !svc.ypbind.is_empty()) {
                 let t = TcpListener::bind(sa).expect("tcp bind");
                 let s = svc.clone();
                 threads.push(std::thread::spawn(move || serve_tcp(t, s, addr, port)));
             }
         }
+    }
+    for (addr, svc) in parse(&conf) {
+        if svc.ypbind.is_empty() {
+            continue;
+        }
+        let svc = Arc::new(svc);
+        let t = TcpListener::bind(SocketAddr::new(addr, YPBIND_PORT)).expect("tcp bind");
+        threads.push(std::thread::spawn(move || serve_tcp(t, svc, addr, YPBIND_PORT)));
     }
     std::fs::write(ready, format!("{}\n", std::process::id())).expect("ready file");
     for t in threads {

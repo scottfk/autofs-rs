@@ -9,6 +9,7 @@ use crate::daemon::module;
 use crate::libautofs::args::{self, Argv};
 use crate::libautofs::cstr;
 use crate::libautofs::defaults::{self, AUTOFS_MAP_DIR};
+use crate::libautofs::mounts;
 use crate::libautofs::nsswitch::{
     self, NSS_STATUS_NOTFOUND, NSS_STATUS_SUCCESS, NSS_STATUS_TRYAGAIN, NSS_STATUS_UNAVAIL, NSS_STATUS_UNKNOWN,
 };
@@ -619,12 +620,62 @@ pub fn do_lookup_mount(ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, name: &[u8])
     l.mount(ap, map, name)
 }
 
+/// `lookup_amd_instance()`: an offset of an amd `type:=host` mount, looked
+/// up in the hosts map instance its mount made.
+fn lookup_amd_instance(ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, name: &[u8]) -> i32 {
+    let logopt = ap.logopt();
+    let root_key = {
+        let mc = map.mc();
+        let c = mc.lock();
+        match c.lookup_distinct(name) {
+            Some(p) if c.get(p).is_mm() => {
+                let r = c.get(p).mm_root.and_then(|id| c.by_id(id)).expect("multi-mount root");
+                c.get(r).key.clone()
+            }
+            _ => {
+                error!(logopt, "lookup_amd_instance", "expected multi mount entry not found");
+                return NSS_STATUS_UNKNOWN;
+            }
+        }
+    };
+    let m_key = bfmt!("{}/{}", ap.path(), root_key);
+    let Some(mnt) = mounts::mnts_find_amdmount(&m_key) else {
+        error!(logopt, "lookup_amd_instance", "expected amd mount entry not found");
+        return NSS_STATUS_UNKNOWN;
+    };
+    let amd_type = master::cstr_or_null(&mnt.amd_type);
+    if !cstr::eq(&amd_type, b"host") {
+        error!(logopt, "lookup_amd_instance", "unexpected map type {}", amd_type);
+        return NSS_STATUS_UNKNOWN;
+    }
+    let argv: Argv = match mnt.amd_opts.as_deref() {
+        Some(o) if !o.is_empty() => vec![Some(o.to_vec())],
+        _ => Vec::new(),
+    };
+    let pargv = if argv.is_empty() { None } else { Some(&argv) };
+    let mut instance = master::master_find_source_instance(map, Some(b"hosts"), Some(b"sun"), pargv);
+    // An nss map instance may have an amd host map sub-instance.
+    if instance.is_none() {
+        for next in map.instances() {
+            instance = master::master_find_source_instance(&next, Some(b"hosts"), Some(b"sun"), pargv);
+            if instance.is_some() {
+                break;
+            }
+        }
+    }
+    let Some(instance) = instance else {
+        error!(logopt, "lookup_amd_instance", "expected hosts map instance not found");
+        return NSS_STATUS_UNKNOWN;
+    };
+    do_lookup_mount(ap, &instance, name)
+}
+
 /// `lookup_name_file_source_instance()`.
 fn lookup_name_file_source_instance(ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, name: &[u8]) -> i32 {
     let logopt = ap.logopt();
     let age = sys::monotonic_time();
     if name.first() == Some(&b'/') && map.lock().flags & MAP_FLAG_FORMAT_AMD != 0 {
-        panic!("amd host instance lookups aren't ported yet (phase 5, with the hosts map)");
+        return lookup_amd_instance(ap, map, name);
     }
     if map.argv().is_empty() {
         error!(logopt, "lookup_name_file_source_instance", "invalid arguments for autofs_point");
@@ -664,7 +715,7 @@ fn lookup_name_file_source_instance(ap: &Arc<AutofsPoint>, map: &Arc<MapSource>,
 fn lookup_name_source_instance(ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, ty: &[u8], name: &[u8]) -> i32 {
     let age = sys::monotonic_time();
     if name.first() == Some(&b'/') && map.lock().flags & MAP_FLAG_FORMAT_AMD != 0 {
-        panic!("amd host instance lookups aren't ported yet (phase 5, with the hosts map)");
+        return lookup_amd_instance(ap, map, name);
     }
     let format = map.format();
     let instance = match master::master_find_source_instance(map, Some(ty), format.as_deref(), None) {
@@ -699,7 +750,7 @@ fn do_name_lookup_mount(ap: &Arc<AutofsPoint>, map: &Arc<MapSource>, name: &[u8]
         return NSS_STATUS_UNKNOWN;
     };
     if name.first() == Some(&b'/') && flags & MAP_FLAG_FORMAT_AMD != 0 {
-        panic!("amd host instance lookups aren't ported yet (phase 5, with the hosts map)");
+        return lookup_amd_instance(ap, map, name);
     }
     if !cstr::neq(&ty, b"file", 4) || a0.first() == Some(&b'/') {
         return do_lookup_mount(ap, map, name);
